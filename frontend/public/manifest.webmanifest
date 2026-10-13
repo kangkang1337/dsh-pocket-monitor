@@ -1,0 +1,19 @@
+{
+  "name": "DSH Pocket Monitor",
+  "short_name": "DSH 监控",
+  "description": "在 iPhone 上只读查看 Windows 上 DSH 的任务状态、活动事件与待审批请求。",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f6f7f9",
+  "theme_color": "#f6f7f9",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

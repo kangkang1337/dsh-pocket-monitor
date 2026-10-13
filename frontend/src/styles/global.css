@@ -1,0 +1,184 @@
+/**
+ * Global styles: light/dark adaptive tokens, phone-first typography, and the
+ * shared button/badge/section primitives the components use.
+ */
+
+:root {
+  --bg: #f6f7f9;
+  --card: #ffffff;
+  --field: #eef0f4;
+  --text: #14161a;
+  --muted: #6b7280;
+  --line: #e2e5ea;
+  --accent: #3556f0;
+  --ok: #127a4a;
+  --ok-bg: #e7f6ee;
+  --ok-line: #b7e2cb;
+  --warn: #8a5a08;
+  --warn-bg: #fdf4e3;
+  --warn-line: #f0dcae;
+  --bad: #a52424;
+  --bad-bg: #fdecec;
+  --bad-line: #f2c2c2;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #101215;
+    --card: #171a1f;
+    --field: #21252b;
+    --text: #e9ecf1;
+    --muted: #9aa1ac;
+    --line: #272b32;
+    --accent: #7f96ff;
+    --ok: #5fd39b;
+    --ok-bg: #12261d;
+    --ok-line: #23503a;
+    --warn: #f0c470;
+    --warn-bg: #2a2114;
+    --warn-line: #55411f;
+    --bad: #ff9a9a;
+    --bad-bg: #2b1616;
+    --bad-line: #583030;
+    color-scheme: dark;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+  -webkit-text-size-adjust: 100%;
+  overscroll-behavior-y: none;
+}
+
+body {
+  min-height: 100dvh;
+}
+
+button {
+  font-family: inherit;
+  font-size: inherit;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* Shared primitives ------------------------------------------------------- */
+
+.section__title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.btn {
+  border-radius: 12px;
+  padding: 12px 14px;
+  font-size: 14px;
+  font-weight: 600;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--text);
+  min-height: 44px;
+  transition: transform 0.06s ease;
+}
+
+.btn:active:not(:disabled) {
+  transform: scale(0.985);
+}
+
+.btn--primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.btn--ghost {
+  background: transparent;
+  color: var(--text);
+}
+
+.btn--approve {
+  background: var(--ok-bg);
+  border-color: var(--ok-line);
+  color: var(--ok);
+}
+
+.btn--reject {
+  background: var(--bad-bg);
+  border-color: var(--bad-line);
+  color: var(--bad);
+}
+
+.btn--danger {
+  background: var(--bad);
+  border-color: var(--bad);
+  color: #fff;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--field);
+  color: var(--muted);
+}
+
+.badge--ok {
+  color: var(--ok);
+  border-color: var(--ok-line);
+  background: var(--ok-bg);
+}
+
+.badge--warn {
+  color: var(--warn);
+  border-color: var(--warn-line);
+  background: var(--warn-bg);
+}
+
+.badge--bad {
+  color: var(--bad);
+  border-color: var(--bad-line);
+  background: var(--bad-bg);
+}
+
+.pill {
+  font-size: 11px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--field);
+  color: var(--muted);
+}
+
+.pill--warn {
+  color: var(--warn);
+  border-color: var(--warn-line);
+  background: var(--warn-bg);
+}
+
+.pill--idle {
+  color: var(--muted);
+}

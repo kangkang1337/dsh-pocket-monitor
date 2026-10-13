@@ -1,0 +1,38 @@
+{
+  "name": "dsh-pocket-monitor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "手机端只读监控 Windows 上 DSH 任务状态的局域网工具（不修改 DSH，不依赖 DSH 插件）",
+  "type": "module",
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "workspaces": [
+    "frontend"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/check-env.mjs",
+    "check:env": "node scripts/check-env.mjs",
+    "build": "npm run build:frontend",
+    "build:frontend": "npm run build --workspace frontend",
+    "dev": "node scripts/dev.mjs",
+    "dev:frontend": "npm run dev --workspace frontend",
+    "dev:backend": "node --experimental-strip-types --watch backend/src/main.ts",
+    "start": "node --experimental-strip-types backend/src/main.ts",
+    "start:lan": "node --experimental-strip-types backend/src/main.ts",
+    "start:windows": "start-lan.cmd",
+    "start:host": "node --experimental-strip-types backend/src/main.ts --host 127.0.0.1",
+    "approve": "node --experimental-strip-types backend/src/cli/approve.ts",
+    "test": "node --experimental-strip-types scripts/run-tests.mjs",
+    "test:node": "node --experimental-strip-types --test backend/tests/*.test.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json && npm run typecheck --workspace frontend"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/qrcode": "^1.5.5",
+    "typescript": "^5.7.2"
+  }
+}
