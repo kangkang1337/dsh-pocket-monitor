@@ -76,6 +76,8 @@ async function main(): Promise<void> {
     dshHome: config.dshHome,
     workspace: config.workspace,
     pollIntervalMs: config.pollIntervalMs,
+    watchAll: config.watchAll,
+    maxSessions: config.maxSessions,
   })
 
   const gate = new PublicGate({
@@ -108,7 +110,9 @@ async function main(): Promise<void> {
       '',
       `DSH Pocket Monitor v${version}`,
       `  数据源：DSH 会话日志（只读）  ${config.dshHome}\\sessions`,
-      `  工作目录：${config.workspace}`,
+      config.watchAll
+        ? `  工作目录：全部（--watch-all，最多跟踪 ${config.maxSessions} 个会话，手机可两级切换）`
+        : `  工作目录：${config.workspace}`,
       `  监听：${config.host}:${runtime.port}`,
       `  本机地址：http://127.0.0.1:${runtime.port}/`,
       `  公网访问：${publicAccess.mode}${publicAccess.url === null ? '' : `  ${publicAccess.url}`}`,

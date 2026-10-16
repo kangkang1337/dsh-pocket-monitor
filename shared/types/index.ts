@@ -160,6 +160,16 @@ export interface SourceHealth {
   readonly nodeProcessCount?: number
   /** True when this reader can only observe (no external approval channel). */
   readonly approvalWritable: boolean
+  /** True when every project under the sessions root is watched, not one workspace. */
+  readonly watchAll?: boolean
+  /** How many session logs are being tailed right now. */
+  readonly watchedSessionCount?: number
+  /** How many sessions discovery found (may exceed the watched count when capped). */
+  readonly discoveredSessionCount?: number
+  /** Cap applied in watch-all mode. */
+  readonly maxSessions?: number
+  /** How many distinct workspaces the watched sessions belong to. */
+  readonly workspaceCount?: number
 }
 
 /** Whole-dashboard payload for `GET /api/status`. */

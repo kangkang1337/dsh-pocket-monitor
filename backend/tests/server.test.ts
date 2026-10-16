@@ -101,6 +101,8 @@ export function makeConfig(overrides: Partial<MonitorConfig> & { dataDir: string
     publicRequirePin: true,
     behindTlsTerminator: false,
     deviceInactivityDays: 30,
+    watchAll: false,
+    maxSessions: 30,
     ...overrides,
   }
 }

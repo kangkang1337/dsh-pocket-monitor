@@ -79,7 +79,8 @@ npm run start:host       # 只绑定 127.0.0.1，只有本机能打开（调试�
 
 ```powershell
 npm run start:lan -- --port 3100                 # 换端口
-npm run start:lan -- --workspace D:\code\proj    # 监控另一个目录里跑的 DSH
+npm run start:lan -- --workspace D:\code\proj    # 只监控另一个目录里跑的 DSH
+npm run start:lan -- --watch-all                 # 监控这台机器上所有目录的 DSH 会话（见「多会话跟踪」）
 npm run start:lan -- --dsh-home D:\dsh           # DSH_HOME 不在默认位置时
 npm run start:lan -- --trusted-origin mypc.local # 允许额外的 Host 权威
 ```
@@ -161,6 +162,38 @@ curl.exe -s http://127.0.0.1:3099/api/admin/session
 
 界面细节：深浅色自适应、状态用**文字 + 图标**表达（不只靠颜色）、危险操作要**二次确认**、没有聊天框也没有终端输入框。
 
+### 多会话跟踪与切换
+
+DSH 每次运行都会在 `$DSH_HOME/sessions` 下留一份会话日志，**每个会话互不影响**。所以「同时开 TUI 和 web」这种场景可以直接看：
+
+| 情况 | 手机上的表现 |
+| --- | --- |
+| TUI 和 web 在**同一个目录**里跑 | 顶部出现两个会话 chip，点一下切换——**不需要任何配置** |
+| 它们跑在**不同目录** | 默认只跟一个目录。加 `--watch-all` 后全部出现 |
+| 同一目录里跑过很多次 | 每次都留一个会话，全部列出来（默认最多跟 30 个，可用 `--max-sessions` 调整） |
+
+加了 `--watch-all` 之后，手机顶部是**两级切换**：
+
+```
+[3_dsh_remote 2 ●] [dsh-workspace 4] [deepseek-harness 1] …   ← 第一级：工作目录（数字=会话数，●=有会话在运行）
+[跑一下测试 运行中] [改样式 空闲] [旧会话] …                    ← 第二级：该目录下的会话
+```
+
+- 点第一级切换工作目录，第二级立刻跟着换，并自动选中该目录里最近活跃的会话
+- 每个会话 chip 带状态文字（运行中/等待审批/空闲/失败…），不只是改颜色
+- 两边可同时用：TUI 那个会话显示「运行中」，web 那个显示「等待审批」，都是各自日志里的真实状态
+
+```powershell
+npm run start:lan -- --watch-all                          # 全机所有会话
+npm run start:lan -- --watch-all --max-sessions 50        # 会话很多时放宽上限
+```
+
+**开销**：每个会话一个增量读取器，首次扫描会读所有会话的文件头（实测 30+ 会话约 640ms），之后每次轮询只读新增字节（实测约 10ms），发现结果按 sessions 根目录的修改时间缓存。超过上限时**只跟最近活跃的那些，并在状态行里说明**（不会静默丢会话）：
+
+```
+正在跟踪全机 30 个会话日志（最新一批事件刚落盘）。共发现 32 个会话，只跟踪最近活跃的 30 个（可用 --max-sessions 调整）。
+```
+
 > **审批在手机上是「提示」而不是「按钮」**：因为 DSH 这一版没有面向外部进程的审批通道（理由见下文），手机端不会给你一个点了也没用的按钮，而是把 DSH 真正在要什么说清楚，例如：
 >
 > > DSH 需要你的授权：把沙箱提升到 danger-full-access，以便「执行命令行」（building the frontend needs to spawn a child process）。请在运行 DSH 的电脑上批准，手机端只能查看。
@@ -176,6 +209,8 @@ curl.exe -s http://127.0.0.1:3099/api/admin/session
 | `--host` | `DSH_POCKET_MONITOR_HOST` | `0.0.0.0` | 绑定地址。绑 `0.0.0.0` 只是「监听所有网卡」，真正的访问控制靠 Host/Origin 校验 + 设备令牌 + 配对 |
 | `--port` | `DSH_POCKET_MONITOR_PORT` | `3099` | 端口；传 `0` 由系统分配 |
 | `--workspace` | `DSH_POCKET_MONITOR_WORKSPACE` | 当前目录 | 要监控哪个工作目录里跑的 DSH 会话 |
+| `--watch-all` | `DSH_POCKET_MONITOR_WATCH_ALL=1` | 关闭 | 监控这台机器上**所有**工作目录的会话（手机两级切换，见「多会话跟踪」） |
+| `--max-sessions` | `DSH_POCKET_MONITOR_MAX_SESSIONS` | `30` | `--watch-all` 时最多同时跟踪多少个会话（超出时保留最近活跃的，并在状态里说明） |
 | `--dsh-home` | `DSH_HOME` | `%USERPROFILE%\.dsh` | DSH Home；会话日志在 `<dsh-home>\sessions` |
 | `--poll` | `DSH_POCKET_MONITOR_POLL` | `1000` | 会话日志扫描间隔（毫秒，最小 200） |
 | `--pair-ttl` | `DSH_POCKET_MONITOR_PAIR_TTL` | `300` | 配对码有效期（秒，最小 30） |

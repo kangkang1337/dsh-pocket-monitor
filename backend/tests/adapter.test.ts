@@ -376,6 +376,84 @@ test('DshSessionSource discovers this workspace and projects real DSH logs', asy
   }
 })
 
+test('watch-all follows every workspace and tags each session with its own cwd', async () => {
+  const root = await tempDir('dpm-watch-all-')
+  const sessionsRoot = join(root, 'sessions')
+  const wsA = 'C:\\work\\alpha'
+  const wsB = 'D:\\code\\beta'
+  const wsC = 'C:\\work\\gamma'
+  try {
+    await writeSessionLog(sessionsRoot, { id: 'a1', cwd: wsA, events: [event('turn/start', 0, 5_000, { turn: 1 })] })
+    await writeSessionLog(sessionsRoot, { id: 'a2', cwd: wsA, events: [event('turn/start', 0, 4_000, { turn: 1 })] })
+    await writeSessionLog(sessionsRoot, { id: 'b1', cwd: wsB, events: [event('turn/start', 0, 3_000, { turn: 1 })] })
+    await writeSessionLog(sessionsRoot, { id: 'c1', cwd: wsC, events: [event('turn/start', 0, 2_000, { turn: 1 })] })
+
+    // One workspace only, for comparison.
+    const single = new DshSessionSource({ dshHome: root, workspace: wsC, pollIntervalMs: 1_000 })
+    const singleSnapshot = await single.snapshot()
+    assert.equal(singleSnapshot.payload.sessions.length, 1, '不开启时只跟一个工作目录')
+    assert.equal(singleSnapshot.payload.source.watchAll, false)
+
+    const all = new DshSessionSource({ dshHome: root, workspace: wsA, pollIntervalMs: 1_000, watchAll: true })
+    const snapshot = await all.snapshot()
+    assert.equal(snapshot.payload.sessions.length, 4, 'watch-all 覆盖所有工作目录')
+    assert.equal(snapshot.payload.source.watchAll, true)
+    assert.equal(snapshot.payload.source.workspaceCount, 3)
+    assert.equal(snapshot.payload.source.watchedSessionCount, 4)
+    assert.equal(snapshot.payload.source.discoveredSessionCount, 4)
+    assert.match(snapshot.payload.source.message, /全机/)
+
+    // Each session is tagged with its own recorded cwd, which is what the phone
+    // groups by — the watcher's configured workspace must not leak onto others.
+    const byId = new Map(snapshot.payload.sessions.map((view) => [view.sessionId, view]))
+    assert.equal(normalisePath(String(byId.get('a1')?.cwd)), normalisePath(wsA))
+    assert.equal(normalisePath(String(byId.get('b1')?.cwd)), normalisePath(wsB))
+    assert.equal(normalisePath(String(byId.get('c1')?.cwd)), normalisePath(wsC))
+
+    // Most recently active session wins the "current" slot.
+    assert.equal(snapshot.payload.currentSessionId, 'a1')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('watch-all caps the number of tailed sessions and says so', async () => {
+  const root = await tempDir('dpm-watch-cap-')
+  const sessionsRoot = join(root, 'sessions')
+  try {
+    // Five sessions with increasing activity times, so the ranking is knowable.
+    for (let index = 1; index <= 5; index += 1) {
+      await writeSessionLog(sessionsRoot, {
+        id: `s${index}`,
+        cwd: `C:\\work\\p${index}`,
+        events: [event('turn/start', 0, index * 1_000, { turn: 1 })],
+      })
+    }
+
+    const source = new DshSessionSource({
+      dshHome: root,
+      workspace: 'C:\\work\\p1',
+      pollIntervalMs: 1_000,
+      watchAll: true,
+      maxSessions: 2,
+    })
+    const snapshot = await source.snapshot()
+    assert.equal(snapshot.payload.sessions.length, 2, '超过上限时只跟最近的几个')
+    assert.equal(snapshot.payload.source.watchedSessionCount, 2)
+    assert.equal(snapshot.payload.source.discoveredSessionCount, 5)
+    assert.equal(snapshot.payload.source.maxSessions, 2)
+    // Truncation is stated, never silent.
+    assert.match(snapshot.payload.source.message, /共发现 5 个会话/)
+    assert.match(snapshot.payload.source.message, /--max-sessions/)
+
+    // The two most recently written sessions are the ones kept.
+    const kept = new Set(snapshot.payload.sessions.map((view) => view.sessionId))
+    assert.deepEqual([...kept].sort(), ['s4', 's5'])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('DshSessionSource reports a missing project without inventing data', async () => {
   const root = await tempDir('dpm-home-empty-')
   try {

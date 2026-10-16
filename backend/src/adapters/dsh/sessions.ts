@@ -36,22 +36,47 @@ const DECIDED_WINDOW = 20
 export interface DshSourceConfig {
   /** `$DSH_HOME`; defaults to `<home>/.dsh`. */
   readonly dshHome: string
-  /** Workspace whose project directory is watched. */
+  /** Workspace whose project directory is watched (ignored when `watchAll`). */
   readonly workspace: string
   /** Poll interval in milliseconds. */
   readonly pollIntervalMs: number
+  /**
+   * Watch every project under the sessions root instead of one workspace, so a
+   * TUI session in one directory and a web session in another show up together.
+   */
+  readonly watchAll?: boolean
+  /** Upper bound on watched sessions in watch-all mode (default 30). */
+  readonly maxSessions?: number
 }
 
 /** One watched session: its artifact path and incremental reader. */
 interface WatchedSession {
   readonly sessionId: string
   readonly path: string
+  /** Workspace recorded in the session header (what the phone groups by). */
+  readonly workspace: string
   readonly formatVersion: number
   readonly newerGenerations: readonly string[]
   readonly tailer: SessionLogTailer
   /** Last artifact modification time, read through to the tailer. */
   readonly modifiedAt: number
 }
+
+/** A discovered session artifact before it is watched. */
+interface DiscoveredSession {
+  readonly sessionId: string
+  readonly path: string
+  readonly workspace: string
+  readonly version: number
+  readonly newer: readonly string[]
+  /** Artifact mtime, used only to rank candidates in watch-all mode. */
+  readonly modifiedAt: number
+}
+
+/** How long a discovery result is trusted before the sessions root is rescanned. */
+const DISCOVERY_TTL_MS = 3_000
+/** Default cap on watched sessions in watch-all mode. */
+const DEFAULT_MAX_SESSIONS = 30
 
 /** One session's projected snapshot. */
 export interface SessionSnapshot {
@@ -132,7 +157,39 @@ function rankSessionFiles(names: readonly string[]): Array<{ name: string; versi
 }
 
 /**
- * Watch DSH session logs for one workspace and expose confirmable facts.
+ * Whether a project directory key literally encodes this workspace.
+ *
+ * Deliberately permissive: it only rejects directories whose key disagrees with
+ * the workspace's own key prefix, which is enough to skip unrelated projects
+ * without re-reading every header. The recorded `cwd` remains the real test.
+ *
+ * @param projectDir - absolute project directory under the sessions root.
+ * @param wantedCwd - normalised workspace path.
+ * @returns true when the directory is worth inspecting.
+ */
+function projectKeyMatches(projectDir: string, wantedCwd: string): boolean {
+  const key = projectDir.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? ''
+  let expected: string
+  try {
+    expected = projectKey(wantedCwd)
+  } catch {
+    return true
+  }
+  // Both keys are `--<slug>--`; compare the slug prefix so a case difference or a
+  // trailing segment does not hide a legitimate match.
+  const strip = (value: string): string => value.replace(/^-+|-+$/g, '').toLowerCase()
+  const left = strip(key)
+  const right = strip(expected)
+  if (left === right) return true
+  const shorter = left.length < right.length ? left : right
+  return shorter.length >= 3 && (left.startsWith(right) || right.startsWith(left))
+}
+
+/**
+ * Watch DSH session logs and expose confirmable facts.
+ *
+ * Without `watchAll` it follows one workspace; with it, every project under the
+ * sessions root, each session tagged with the workspace from its own header.
  *
  * The adapter never claims more than it can prove: a session's state comes from
  * turn/step/tool/approval events, and "connected" means "this artifact is
@@ -149,11 +206,25 @@ export class DshSessionSource {
   private statusMessage = '尚未扫描'
   private projectDir: string | undefined
   private projectDirExists = false
+  /** Cached discovery result, invalidated when the sessions root changes. */
+  private discoveryCache: { readonly at: number; readonly rootMtime: number; readonly sessions: readonly DiscoveredSession[] } | undefined
+  /** Human note about watch-all truncation, surfaced in the status message. */
+  private truncationNote: string | undefined
 
   constructor(config: DshSourceConfig, processes = new DshProcessProbe()) {
     this.config = config
     this.sessionsRoot = join(config.dshHome, 'sessions')
     this.processes = processes
+  }
+
+  /** Whether every project under the sessions root is watched. */
+  get watchingAll(): boolean {
+    return this.config.watchAll === true
+  }
+
+  /** Upper bound on watched sessions. */
+  get maxSessions(): number {
+    return this.config.maxSessions ?? DEFAULT_MAX_SESSIONS
   }
 
   /** Absolute path of the project directory this workspace maps to. */
@@ -164,9 +235,12 @@ export class DshSessionSource {
   /** Refresh every watched artifact. Call this on the poll interval. */
   async refresh(): Promise<void> {
     this.lastScanAt = Date.now()
-    this.projectDir = join(this.sessionsRoot, projectKey(this.config.workspace))
-    const sessions = await this.discoverSessions()
-    this.projectDirExists = sessions.length > 0 || (await this.isDirectory(this.projectDir))
+    this.projectDir = this.watchingAll ? undefined : join(this.sessionsRoot, projectKey(this.config.workspace))
+    const discovered = await this.discoverSessions()
+    this.projectDirExists =
+      discovered.length > 0 ||
+      (this.projectDir !== undefined && (await this.isDirectory(this.projectDir)))
+    const sessions = await this.selectSessions(discovered)
     const seen = new Set<string>()
 
     for (const artifact of sessions) {
@@ -177,6 +251,7 @@ export class DshSessionSource {
         watcher = {
           sessionId: artifact.sessionId,
           path: artifact.path,
+          workspace: artifact.workspace,
           formatVersion: artifact.version,
           newerGenerations: artifact.newer,
           tailer,
@@ -195,6 +270,26 @@ export class DshSessionSource {
     this.updateStatus()
   }
 
+  /**
+   * Decide which discovered sessions to watch.
+   *
+   * Without `watchAll` this is "everything in the chosen workspace". With it, the
+   * cap keeps a long-lived DSH home from making the poll unbounded: the most
+   * recently written sessions win, and the truncation is stated rather than
+   * silently dropping sessions.
+   */
+  private async selectSessions(discovered: readonly DiscoveredSession[]): Promise<readonly DiscoveredSession[]> {
+    const cap = this.maxSessions
+    if (discovered.length <= cap) {
+      this.truncationNote = undefined
+      return discovered
+    }
+    const ranked = [...discovered].sort((a, b) => b.modifiedAt - a.modifiedAt)
+    const kept = ranked.slice(0, cap)
+    this.truncationNote = `共发现 ${discovered.length} 个会话，只跟踪最近活跃的 ${cap} 个（可用 --max-sessions 调整）。`
+    return kept
+  }
+
   /** Compute the connection status from the last refresh. */
   private updateStatus(): void {
     const watchers = [...this.watchers.values()]
@@ -206,76 +301,124 @@ export class DshSessionSource {
     }
     if (watchers.length === 0) {
       this.lastStatus = 'source-missing'
-      this.statusMessage = this.projectDirExists
-        ? '找到项目目录，但里面还没有会话日志'
-        : '还没找到这个工作目录的 DSH 会话日志（DSH 可能还没在这个目录里跑过）'
+      this.statusMessage = this.watchingAll
+        ? '还没找到任何 DSH 会话日志（DSH 可能还没在这台机器上跑过）'
+        : this.projectDirExists
+          ? '找到项目目录，但里面还没有会话日志'
+          : '还没找到这个工作目录的 DSH 会话日志（DSH 可能还没在这个目录里跑过）'
       return
     }
     const newest = watchers
       .map((w) => ({ w, at: w.tailer.state?.lastEventAt ?? 0, mtime: w.modifiedAt }))
       .sort((a, b) => b.at - a.at || b.mtime - a.mtime)[0]
     const live = newest !== undefined && now - newest.w.modifiedAt <= LIVE_WINDOW_MS
-    if (live) {
-      this.lastStatus = 'connected'
-      this.statusMessage = `正在跟踪 ${watchers.length} 个会话日志，最新一批事件刚落盘`
-    } else {
-      this.lastStatus = 'watching'
-      this.statusMessage = `正在跟踪 ${watchers.length} 个会话日志（当前没有新的追加）`
-    }
+    const source = this.watchingAll ? '全机' : '当前'
+    this.lastStatus = live ? 'connected' : 'watching'
+    const tail = live ? '最新一批事件刚落盘' : '当前没有新的追加'
+    this.statusMessage = `正在跟踪${source} ${watchers.length} 个会话日志（${tail}）`
+    if (this.truncationNote !== undefined) this.statusMessage = `${this.statusMessage}。${this.truncationNote}`
   }
 
   /**
-   * Discover this workspace's session artifacts.
+   * Discover session artifacts.
    *
-   * The project-directory key is lossy, so the computed key is only a fast path:
-   * every candidate project directory is confirmed by the `cwd` DSH recorded in
-   * the session header, and any project directory may contribute.
+   * In workspace mode the project-directory key is only a fast path: the key is
+   * lossy, so every candidate project directory is confirmed by the `cwd` DSH
+   * recorded in the session header. In watch-all mode every project directory is
+   * read, and each session carries the workspace from its own header — that is
+   * what lets a TUI session in one directory and a web session in another appear
+   * side by side on the phone.
+   *
+   * The result is cached until the sessions root changes (a new project directory
+   * or a new session directory bumps its mtime), so watching dozens of sessions
+   * does not mean re-reading dozens of headers on every poll.
    */
-  private async discoverSessions(): Promise<
-    Array<{ sessionId: string; path: string; version: number; newer: readonly string[] }>
-  > {
+  private async discoverSessions(): Promise<readonly DiscoveredSession[]> {
+    const rootMtime = await this.modifiedTime(this.sessionsRoot)
+    const cached = this.discoveryCache
+    if (cached !== undefined && cached.rootMtime === rootMtime && Date.now() - cached.at < DISCOVERY_TTL_MS * 4) {
+      return cached.sessions
+    }
+    const sessions = this.watchingAll ? await this.discoverEveryProject() : await this.discoverWorkspace()
+    this.discoveryCache = { at: Date.now(), rootMtime, sessions }
+    return sessions
+  }
+
+  /** Discover every session under every project directory (watch-all mode). */
+  private async discoverEveryProject(): Promise<readonly DiscoveredSession[]> {
+    const found: DiscoveredSession[] = []
+    for (const entry of await this.listDirectories(this.sessionsRoot)) {
+      for (const sessionDir of await this.listDirectories(entry)) {
+        const artifacts = await this.collectArtifacts(sessionDir)
+        found.push(...artifacts)
+      }
+    }
+    return found
+  }
+
+  /** Discover this workspace's session artifacts (single-workspace mode). */
+  private async discoverWorkspace(): Promise<readonly DiscoveredSession[]> {
     const projectDirs = new Set<string>()
     if (this.projectDir !== undefined && (await this.isDirectory(this.projectDir))) projectDirs.add(this.projectDir)
 
-    let entries: string[] = []
-    try {
-      entries = await readdir(this.sessionsRoot)
-    } catch {
-      entries = []
-    }
     const wanted = normalisePath(this.config.workspace)
-    for (const entry of entries) {
-      const path = join(this.sessionsRoot, entry)
+    for (const path of await this.listDirectories(this.sessionsRoot)) {
       if (projectDirs.has(path)) continue
-      if (!(await this.isDirectory(path))) continue
-      // Header-level match: at most a handful of sessions are inspected per project.
+      // Coarse filter first: only project directories whose key could encode this
+      // workspace are worth confirming against the recorded header.
+      if (!projectKeyMatches(path, wanted)) continue
       const sessionDirs = await this.listDirectories(path)
       for (const sessionDir of sessionDirs.slice(0, 8)) {
-        const artifact = await this.pickArtifact(sessionDir)
-        if (artifact === undefined) continue
-        const cwd = await this.readHeaderCwd(artifact.path)
-        if (cwd !== undefined && normalisePath(cwd) === wanted) {
+        const artifacts = await this.collectArtifacts(sessionDir)
+        if (artifacts.length === 0) continue
+        if (artifacts.some((artifact) => normalisePath(artifact.workspace) === wanted)) {
           projectDirs.add(path)
           break
         }
       }
     }
 
-    const artifacts: Array<{ sessionId: string; path: string; version: number; newer: readonly string[] }> = []
+    const found: DiscoveredSession[] = []
     for (const projectDir of projectDirs) {
       for (const sessionDir of await this.listDirectories(projectDir)) {
-        const artifact = await this.pickArtifact(sessionDir)
-        if (artifact !== undefined) artifacts.push(artifact)
+        for (const artifact of await this.collectArtifacts(sessionDir)) {
+          if (normalisePath(artifact.workspace) === wanted) found.push(artifact)
+        }
       }
     }
-    return artifacts
+    return found
   }
 
-  /** Read just the header of an artifact (frame 1) to learn its recorded cwd. */
-  private async readHeaderCwd(path: string): Promise<string | undefined> {
+  /**
+   * Read one session directory's artifact (header included).
+   *
+   * @param sessionDir - directory holding the session log.
+   * @returns the artifact, or an empty list when there is nothing readable.
+   */
+  private async collectArtifacts(sessionDir: string): Promise<readonly DiscoveredSession[]> {
+    const artifact = await this.pickArtifact(sessionDir)
+    if (artifact === undefined) return []
+    const header = await this.readHeader(artifact.path)
+    if (header?.cwd === undefined) return []
+    return [
+      {
+        sessionId: artifact.sessionId,
+        path: artifact.path,
+        workspace: header.cwd,
+        version: artifact.version,
+        newer: artifact.newer,
+        modifiedAt: header.modifiedAt,
+      },
+    ]
+  }
+
+  /** Read just the header of an artifact (frame 1) plus its file mtime. */
+  private async readHeader(path: string): Promise<{ cwd: string; modifiedAt: number } | undefined> {
     const probe = new SessionLogTailer(path)
     await probe.update()
-    return probe.state?.header.cwd
+    const cwd = probe.state?.header.cwd
+    if (cwd === undefined) return undefined
+    return { cwd, modifiedAt: probe.modifiedAt }
   }
 
   /** List session-owned directories under one project directory. */
@@ -316,6 +459,23 @@ export class DshSessionSource {
       return stats.isDirectory()
     } catch {
       return false
+    }
+  }
+
+  /**
+   * Modification time of a path, or a sentinel when it cannot be read.
+   *
+   * Used to invalidate the discovery cache: a new project or session directory
+   * changes the mtime of its parent, which is exactly when a rescan is needed.
+   *
+   * @param path - path to stat.
+   * @returns epoch milliseconds, or -1 when unreadable.
+   */
+  private async modifiedTime(path: string): Promise<number> {
+    try {
+      return (await stat(path)).mtimeMs
+    } catch {
+      return -1
     }
   }
 
@@ -369,6 +529,14 @@ export class DshSessionSource {
       processNote: probes.error,
       nodeProcessCount: probes.nodeProcessCount,
       approvalWritable: false,
+      watchAll: this.watchingAll,
+      watchedSessionCount: this.watchers.size,
+      discoveredSessionCount: this.discoveryCache?.sessions.length ?? this.watchers.size,
+      maxSessions: this.maxSessions,
+      // Group by the normalised path: Windows records the same directory with
+      // different casing (`system32` vs `System32`), which must not become two
+      // workspaces (and therefore two project chips) on the phone.
+      workspaceCount: new Set([...this.watchers.values()].map((watcher) => normalisePath(watcher.workspace))).size,
     }
 
     const payload: StatusPayload = {

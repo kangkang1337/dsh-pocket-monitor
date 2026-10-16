@@ -39,6 +39,13 @@ export interface MonitorConfig {
    * record becomes removable. `0` disables expiry (revoke-only).
    */
   readonly deviceInactivityDays: number
+  /**
+   * Watch every project under the sessions root instead of one workspace, so a
+   * TUI session in one directory and a web session in another both show up.
+   */
+  readonly watchAll: boolean
+  /** Cap on watched sessions when `watchAll` is on. */
+  readonly maxSessions: number
   /** Enable public-access mode: accept requests on a non-LAN authority. */
   readonly public: boolean
   /** The public authority this service is reachable at (host or host:port). */
@@ -75,6 +82,8 @@ export interface CliOptions {
   readonly tlsCertPath?: string
   readonly tlsKeyPath?: string
   readonly deviceInactivityDays?: number
+  readonly watchAll?: boolean
+  readonly maxSessions?: number
 }
 
 /** Flags that take a value, so the parser can reject a missing one. */
@@ -92,10 +101,11 @@ const VALUE_FLAGS = new Set([
   '--tls-cert',
   '--tls-key',
   '--device-ttl',
+  '--max-sessions',
 ])
 
 /** Boolean flags. */
-const BOOLEAN_FLAGS = new Set(['--no-terminal-approval', '--no-qr', '--public', '--behind-tls', '--public-no-pin'])
+const BOOLEAN_FLAGS = new Set(['--no-terminal-approval', '--no-qr', '--public', '--behind-tls', '--public-no-pin', '--watch-all'])
 
 /**
  * Parse monitor-specific flags out of `argv`.
@@ -126,6 +136,8 @@ export function parseCliOptions(argv: readonly string[]): CliOptions {
   let tlsCertPath: string | undefined
   let tlsKeyPath: string | undefined
   let deviceInactivityDays: number | undefined
+  let watchAll: boolean | undefined
+  let maxSessions: number | undefined
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]
@@ -136,6 +148,7 @@ export function parseCliOptions(argv: readonly string[]): CliOptions {
       if (arg === '--public') publicMode = true
       if (arg === '--behind-tls') behindTlsTerminator = true
       if (arg === '--public-no-pin') publicRequirePin = false
+      if (arg === '--watch-all') watchAll = true
       continue
     }
     const value = argv[i + 1]
@@ -154,6 +167,14 @@ export function parseCliOptions(argv: readonly string[]): CliOptions {
       case '--workspace':
         workspace = resolve(value)
         break
+      case '--max-sessions': {
+        const parsed = Number(value)
+        if (!Number.isInteger(parsed) || parsed < 1 || parsed > 500) {
+          throw new Error(`--max-sessions 必须是 1-500 的整数，收到 ${value}`)
+        }
+        maxSessions = parsed
+        break
+      }
       case '--dsh-home':
         dshHome = resolve(value)
         break
@@ -219,6 +240,8 @@ export function parseCliOptions(argv: readonly string[]): CliOptions {
     ...(tlsCertPath === undefined ? {} : { tlsCertPath }),
     ...(tlsKeyPath === undefined ? {} : { tlsKeyPath }),
     ...(deviceInactivityDays === undefined ? {} : { deviceInactivityDays }),
+    ...(watchAll === undefined ? {} : { watchAll }),
+    ...(maxSessions === undefined ? {} : { maxSessions }),
   }
 }
 
@@ -261,6 +284,8 @@ export function resolveConfig(
     behindTlsTerminator: options.behindTlsTerminator ?? env.DSH_POCKET_MONITOR_BEHIND_TLS === '1',
     deviceInactivityDays:
       options.deviceInactivityDays ?? numberFromEnv(env.DSH_POCKET_MONITOR_DEVICE_TTL_DAYS, 30),
+    watchAll: options.watchAll ?? env.DSH_POCKET_MONITOR_WATCH_ALL === '1',
+    maxSessions: options.maxSessions ?? numberFromEnv(env.DSH_POCKET_MONITOR_MAX_SESSIONS, 30),
     ...(tlsCertPath === undefined ? {} : { tlsCertPath }),
     ...(tlsKeyPath === undefined ? {} : { tlsKeyPath }),
   }

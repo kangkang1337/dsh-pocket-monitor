@@ -5,8 +5,8 @@
  * no command input, and no terminal — the phone can only read and decide.
  */
 import { computed, onMounted, ref } from 'vue'
-import { monitor } from '../stores/monitor.ts'
-import { shortTitle } from '../utils/format.ts'
+import { monitor, normaliseWorkspace } from '../stores/monitor.ts'
+import { shortTitle, sessionStateLabel } from '../utils/format.ts'
 import ConnectionBanner from '../components/ConnectionBanner.vue'
 import StatusOverview from '../components/StatusOverview.vue'
 import Timeline from '../components/Timeline.vue'
@@ -18,8 +18,18 @@ type Tab = 'status' | 'activity' | 'processes' | 'approvals' | 'settings'
 
 const state = monitor.state
 const tab = ref<Tab>('status')
-const sessions = computed(() => state.status?.sessions ?? [])
 const pendingCount = computed(() => monitor.pendingApprovals.value.length)
+
+/** Level one: workspaces that currently have sessions. */
+const workspaceGroups = computed(() => monitor.workspaces.value)
+/** Level two: sessions inside the selected workspace. */
+const visibleSessions = computed(() => monitor.visibleSessions.value)
+const activeWorkspaceKey = computed(() => {
+  const selected = state.selectedSessionId
+  const session = state.status?.sessions.find((entry) => entry.sessionId === selected)
+  if (session !== undefined) return normaliseWorkspace(session.cwd)
+  return workspaceGroups.value[0]?.key
+})
 
 const tabs: Array<{ id: Tab; label: string; badge?: number }> = [
   { id: 'status', label: '概览' },
@@ -36,6 +46,11 @@ onMounted(() => {
 /** Show a session and load its timeline when needed. */
 function pick(sessionId: string): void {
   monitor.selectSession(sessionId)
+}
+
+/** Short state text for a session chip (text, not colour alone). */
+function stateLabel(value: string): string {
+  return sessionStateLabel(value)
 }
 </script>
 
@@ -56,15 +71,31 @@ function pick(sessionId: string): void {
       </div>
       <ConnectionBanner />
 
-      <nav class="tabs" v-if="sessions.length > 1">
+      <nav class="tabs tabs--workspace" v-if="workspaceGroups.length > 1" aria-label="工作目录">
         <button
-          v-for="session in sessions.slice(0, 6)"
+          v-for="group in workspaceGroups"
+          :key="group.key"
+          class="tab-chip tab-chip--project"
+          :class="{ 'tab-chip--active': group.key === activeWorkspaceKey }"
+          @click="monitor.selectWorkspace(group.key)"
+          :title="group.fullPath"
+        >
+          {{ group.label }}
+          <span class="tab-chip__count">{{ group.sessions.length }}</span>
+          <span v-if="group.runningCount > 0" class="tab-chip__live" aria-label="有会话在运行">●</span>
+        </button>
+      </nav>
+
+      <nav class="tabs" v-if="visibleSessions.length > 1" aria-label="会话">
+        <button
+          v-for="session in visibleSessions"
           :key="session.sessionId"
           class="tab-chip"
           :class="{ 'tab-chip--active': session.sessionId === monitor.currentSession.value?.sessionId }"
           @click="pick(session.sessionId)"
         >
           {{ shortTitle(session.title, session.sessionId.slice(0, 10)) }}
+          <span class="tab-chip__state" :class="'tab-chip__state--' + session.state">{{ stateLabel(session.state) }}</span>
         </button>
       </nav>
     </header>
@@ -209,6 +240,54 @@ function pick(sessionId: string): void {
 .tab-chip--active {
   border-color: var(--accent);
   color: var(--accent);
+}
+
+/* Level one: workspace chips are visually distinct from session chips. */
+.tabs--workspace {
+  margin-bottom: 6px;
+}
+
+.tab-chip--project {
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.tab-chip__count {
+  font-size: 10px;
+  opacity: 0.75;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  padding: 0 4px;
+  line-height: 14px;
+}
+
+.tab-chip__live {
+  font-size: 9px;
+  color: var(--ok, #2e7d32);
+}
+
+.tab-chip__state {
+  margin-left: 5px;
+  font-size: 10px;
+  opacity: 0.8;
+}
+
+.tab-chip__state--running {
+  color: var(--ok, #2e7d32);
+  opacity: 1;
+}
+
+.tab-chip__state--waiting-approval {
+  color: var(--warn, #b26a00);
+  opacity: 1;
+}
+
+.tab-chip__state--failed,
+.tab-chip__state--aborted {
+  color: var(--bad, #c62828);
+  opacity: 1;
 }
 
 .content {

@@ -43,6 +43,8 @@ interface State {
   status: StatusPayload | undefined
   timelines: Record<string, MonitorEvent[]>
   selectedSessionId: string | undefined
+  /** Normalised path of the workspace whose sessions are listed. */
+  selectedWorkspace: string | undefined
   approvals: ApprovalListing | undefined
   publicAccess: PublicAccessStatus | undefined
   link: LinkState
@@ -71,6 +73,7 @@ const state = reactive<State>({
   status: undefined,
   timelines: {},
   selectedSessionId: undefined,
+  selectedWorkspace: undefined,
   approvals: undefined,
   publicAccess: undefined,
   link: 'connecting',
@@ -144,6 +147,10 @@ export interface MonitorStore {
   readonly currentSession: ComputedRef<SessionView | undefined>
   readonly timeline: ComputedRef<readonly MonitorEvent[]>
   readonly pendingApprovals: ComputedRef<readonly PendingApproval[]>
+  /** Workspace groups for the first level of the switcher, most recent first. */
+  readonly workspaces: ComputedRef<readonly WorkspaceGroup[]>
+  /** Sessions inside the selected workspace, for the second level. */
+  readonly visibleSessions: ComputedRef<readonly SessionView[]>
   readonly linkText: ComputedRef<string>
   readonly connected: ComputedRef<boolean>
   initialise: () => Promise<void>
@@ -154,6 +161,8 @@ export interface MonitorStore {
   refreshApprovals: () => Promise<void>
   refreshPublicAccess: () => Promise<void>
   selectSession: (sessionId: string) => void
+  /** Choose a workspace group; the session list below it follows. */
+  selectWorkspace: (workspace: string) => void
   claimPairing: (code: string) => Promise<void>
   resumePairing: (stored: StoredPairing) => Promise<void>
   pollPairing: (stored: StoredPairing) => Promise<void>
@@ -167,6 +176,71 @@ export interface MonitorStore {
   forgetPin: () => void
   dispose: () => void
 }
+
+/**
+ * Normalise a workspace path for grouping.
+ *
+ * Windows records the same directory with different casing (`system32` vs
+ * `System32`), and DSH keeps both spellings in session headers; grouping by the
+ * raw string would show duplicate project chips on the phone.
+ */
+export function normaliseWorkspace(path: string): string {
+  const trimmed = path.replace(/[\\/]+$/, '')
+  return /^[A-Za-z]:/.test(trimmed) || trimmed.includes('\\') ? trimmed.toLowerCase() : trimmed
+}
+
+/** The last path segment, used as a short label for a workspace. */
+export function workspaceLabel(path: string): string {
+  const parts = path.replace(/[\\/]+$/, '').split(/[\\/]/).filter((part) => part !== '')
+  const last = parts[parts.length - 1] ?? path
+  // `C:\` has no trailing segment worth showing; fall back to the drive letter.
+  return last === '' ? path : last
+}
+
+/** One workspace group as the switcher shows it. */
+export interface WorkspaceGroup {
+  readonly key: string
+  /** Label from the first session seen for this workspace (original casing). */
+  readonly label: string
+  readonly fullPath: string
+  readonly sessions: readonly SessionView[]
+  /** How many of its sessions are running right now. */
+  readonly runningCount: number
+  readonly lastEventAt: number
+}
+
+const workspaces = computed<readonly WorkspaceGroup[]>(() => {
+  const payload = state.status
+  if (payload === undefined) return []
+  const groups = new Map<string, { fullPath: string; sessions: SessionView[] }>()
+  for (const session of payload.sessions) {
+    const key = normaliseWorkspace(session.cwd)
+    const existing = groups.get(key)
+    if (existing === undefined) groups.set(key, { fullPath: session.cwd, sessions: [session] })
+    else existing.sessions.push(session)
+  }
+  return [...groups.entries()]
+    .map(([key, group]) => {
+      const sessions = [...group.sessions].sort((a, b) => b.lastEventAt - a.lastEventAt)
+      return {
+        key,
+        label: workspaceLabel(group.fullPath),
+        fullPath: group.fullPath,
+        sessions,
+        runningCount: sessions.filter((session) => session.state === 'running').length,
+        lastEventAt: sessions[0]?.lastEventAt ?? 0,
+      }
+    })
+    .sort((a, b) => b.lastEventAt - a.lastEventAt)
+})
+
+/** Sessions of the selected workspace (all sessions when there is only one). */
+const visibleSessions = computed<readonly SessionView[]>(() => {
+  const all = workspaces.value
+  if (all.length <= 1) return all[0]?.sessions ?? []
+  const chosen = all.find((group) => group.key === state.selectedWorkspace) ?? all[0]
+  return chosen?.sessions ?? []
+})
 
 const currentSession = computed<SessionView | undefined>(() => {
   const payload = state.status
@@ -192,6 +266,8 @@ export const monitor: MonitorStore = {
   currentSession,
   timeline,
   pendingApprovals,
+  workspaces,
+  visibleSessions,
   linkText: computed(() => linkLabel(state.link)),
   connected: computed(() => state.link === 'open'),
 
@@ -382,7 +458,24 @@ export const monitor: MonitorStore = {
   /** Select a session to display. */
   selectSession(sessionId: string): void {
     state.selectedSessionId = sessionId
+    // Keep the workspace level consistent with the session the user picked.
+    const session = state.status?.sessions.find((entry) => entry.sessionId === sessionId)
+    if (session !== undefined) state.selectedWorkspace = normaliseWorkspace(session.cwd)
     if (state.timelines[sessionId] === undefined) void monitor.loadTimeline(sessionId)
+  },
+
+  /**
+   * Choose a workspace; the session list follows it.
+   *
+   * The newly listed workspace's most recent session is selected immediately, so
+   * switching projects never leaves the detail panes showing another project's
+   * session.
+   */
+  selectWorkspace(workspace: string): void {
+    state.selectedWorkspace = workspace
+    const group = workspaces.value.find((entry) => entry.key === workspace)
+    const first = group?.sessions[0]
+    if (first !== undefined) monitor.selectSession(first.sessionId)
   },
 
   /** Submit a pairing code; the phone then waits for desktop confirmation. */
@@ -509,13 +602,24 @@ export const monitor: MonitorStore = {
   },
 }
 
-/** Apply a status payload, keeping the selected session in sync. */
+/** Apply a status payload, keeping the selected session and workspace in sync. */
 function applyStatus(payload: StatusPayload): void {
   state.status = payload
   const ids = new Set(payload.sessions.map((session) => session.sessionId))
   if (state.selectedSessionId !== undefined && !ids.has(state.selectedSessionId)) state.selectedSessionId = undefined
   if (state.selectedSessionId === undefined && payload.sessions.length > 0) {
     state.selectedSessionId = payload.sessions[0]?.sessionId
+  }
+  // Drop a workspace selection that no longer has any session.
+  if (state.selectedWorkspace !== undefined) {
+    const stillThere = payload.sessions.some(
+      (session) => normaliseWorkspace(session.cwd) === state.selectedWorkspace,
+    )
+    if (!stillThere) state.selectedWorkspace = undefined
+  }
+  if (state.selectedWorkspace === undefined && state.selectedSessionId !== undefined) {
+    const selected = payload.sessions.find((session) => session.sessionId === state.selectedSessionId)
+    if (selected !== undefined) state.selectedWorkspace = normaliseWorkspace(selected.cwd)
   }
   state.link = state.link === 'closed' ? 'closed' : state.link
 }

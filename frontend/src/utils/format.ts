@@ -76,7 +76,7 @@ export function diagnoseHint(status: ConnectionStatus, workspace: string): strin
 }
 
 /** Label for the session state. */
-export function sessionStateLabel(state: SessionState): string {
+export function sessionStateLabel(state: SessionState | string): string {
   switch (state) {
     case 'running':
       return '运行中'
