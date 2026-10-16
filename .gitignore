@@ -20,6 +20,8 @@ _probe/
 # 密钥 / 凭证 / 环境
 .env
 .env.*
+# 例外：这是纯注释的配置说明，README 会引用它（不含任何真实值）
+!.env.example
 *.pem
 *.key
 credentials*.json
