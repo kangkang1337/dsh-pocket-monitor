@@ -17,11 +17,11 @@
 | 运行中的其他插件服务 | `0.0.0.0:3081`（同 PID，第三方 `dsh-pocket` 插件自带代理） | `netstat -ano` |
 | Node | `v22.21.0`（内置 `node:zlib` Zstd API） | `node -v` |
 
-会话日志实测样例（本工作目录）：
+会话日志实测样例（路径中的用户名与项目名已替换为占位符）：
 
 ```
-%USERPROFILE%\.dsh\sessions\--C-Users-18500-Desktop-program-personal-3_dsh_remote--\
-  session-f8f5e3c5-1071-4b23-a5ac-6adae2059e68\session.v4.jsonl.zstd
+%USERPROFILE%\.dsh\sessions\--C-Users-<用户名>-Desktop-program-personal-<项目名>--\
+  <会话 UUID>\session.v4.jsonl.zstd
 ```
 
 ## 1. DSH Web 的认证机制（实测）
@@ -99,8 +99,8 @@ async request(req) {
 ### 3.3 Header 形状（实测）
 
 ```json
-{"type":"session","version":4,"id":"session-f8f5e3c5-1071-4b23-a5ac-6adae2059e68",
- "createdAt":1791866167608,"cwd":"C:\\Users\\18500\\Desktop\\program\\personal\\3_dsh_remote",
+{"type":"session","version":4,"id":"<会话 UUID>",
+ "createdAt":1791866167608,"cwd":"C:\\Users\\<用户名>\\Desktop\\program\\personal\\<项目名>",
  "isSeeded":false,"delegationDepth":0,"agentPreset":"standard"}
 ```
 
