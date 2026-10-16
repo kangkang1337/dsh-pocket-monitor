@@ -23,6 +23,7 @@ import { hashToken, sanitiseDeviceName, type DeviceRecord, type DeviceStore } fr
 import { PairingService } from './auth/pairing.ts'
 import { listLanAddresses, type LanAddress } from './services/lan.ts'
 import { PublicGate, generatePin } from './services/public-access.ts'
+import { readVersion } from './version.ts'
 import { SseHub } from './transport/sse.ts'
 import type { MonitorConfig } from './config.ts'
 import type { ApiError, HealthPayload, ServerFrame, StatusPayload } from '../../shared/types/index.ts'
@@ -363,7 +364,7 @@ export class MonitorService {
     if (path === '/api/health' && method === 'GET') {
       const payload: HealthPayload = {
         ok: true,
-        version: '0.1.0',
+        version: await readVersion(),
         pairingOpen: this.pairing.hasActiveCode(),
         requiresPairing: true,
       }

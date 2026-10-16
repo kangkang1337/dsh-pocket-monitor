@@ -10,8 +10,7 @@
  * @module dsh-pocket-monitor/main
  */
 
-import { readFile } from 'node:fs/promises'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { DshSessionSource } from './adapters/dsh/sessions.ts'
 import { DeviceStore } from './auth/devices.ts'
@@ -20,6 +19,7 @@ import { parseCliOptions, resolveConfig, validatePublicMode, type MonitorConfig 
 import { PublicGate } from './services/public-access.ts'
 import { listLanAddresses } from './services/lan.ts'
 import { runDashboard } from './cli/dashboard.ts'
+import { readVersion } from './version.ts'
 
 /** Backend source root, used to locate the built frontend without hard-coded paths. */
 const here = dirname(fileURLToPath(import.meta.url))
@@ -28,21 +28,6 @@ const here = dirname(fileURLToPath(import.meta.url))
 function wantsDashboard(): boolean {
   if (process.env.DSH_POCKET_MONITOR_NO_DASHBOARD === '1') return false
   return process.stdin.isTTY === true && process.stdout.isTTY === true
-}
-
-/** Read this project's version from package.json, tolerating a missing file. */
-async function readVersion(): Promise<string> {
-  for (const candidate of [resolve(here, '../../package.json'), resolve(here, '../../../package.json')]) {
-    try {
-      const parsed: unknown = JSON.parse(await readFile(candidate, 'utf8'))
-      if (typeof parsed === 'object' && parsed !== null && typeof (parsed as { version?: unknown }).version === 'string') {
-        return (parsed as { version: string }).version
-      }
-    } catch {
-      /* try the next candidate */
-    }
-  }
-  return '0.0.0'
 }
 
 /** Locate the built frontend directory. */
