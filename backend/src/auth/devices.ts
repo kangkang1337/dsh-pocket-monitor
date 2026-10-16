@@ -9,7 +9,7 @@
  */
 
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
 /** Scopes a phone session can hold. Deliberately tiny. */
@@ -80,6 +80,46 @@ export function generateToken(): string {
   return randomBytes(32).toString('base64url')
 }
 
+/** Error codes Windows returns when another process briefly holds the file open. */
+const TRANSIENT_WRITE_CODES = new Set(['EPERM', 'EACCES', 'EBUSY', 'ENOTEMPTY', 'EEXIST'])
+
+/** Extract a usable code from an unknown thrown value. */
+function errorCode(error: unknown): string {
+  if (typeof error === 'object' && error !== null) {
+    const code = (error as { code?: unknown }).code
+    if (typeof code === 'string') return code
+  }
+  return ''
+}
+
+/** One-line description of a write failure, for the dashboard. */
+function describeWriteError(error: unknown): string {
+  const code = errorCode(error)
+  const message = error instanceof Error ? error.message : String(error)
+  return code === '' ? message : `${code}: ${message}`
+}
+
+/**
+ * Rename with a short backoff, because Windows refuses a rename while another
+ * process (virus scanner, search indexer, backup agent) has either name open.
+ * The operation is safe to retry: the source is our own temp file.
+ */
+async function renameWithRetry(from: string, to: string, attempts = 5): Promise<void> {
+  let lastError: unknown
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      await rename(from, to)
+      return
+    } catch (error) {
+      lastError = error
+      if (!TRANSIENT_WRITE_CODES.has(errorCode(error))) throw error
+      // 15ms, 30ms, 60ms, 120ms — long enough for a scanner to let go.
+      await new Promise((resolve) => setTimeout(resolve, 15 * 2 ** attempt))
+    }
+  }
+  throw lastError
+}
+
 /**
  * Persistent, revocable device registry with inactivity expiry.
  *
@@ -96,6 +136,10 @@ export class DeviceStore {
   /** Changes not yet written back (final lastSeenAt per device). */
   private readonly pendingTouches = new Map<string, number>()
   private lastFlushAt = 0
+  /** Serialises writers: two overlapping temp+rename pairs can collide on Windows. */
+  private writeQueue: Promise<void> = Promise.resolve()
+  /** Last write failure, surfaced to the dashboard instead of thrown at a phone. */
+  private persistError: string | undefined
 
   constructor(dataDir: string, options: Partial<DeviceStoreOptions> = {}) {
     this.path = join(dataDir, 'devices.json')
@@ -112,6 +156,11 @@ export class DeviceStore {
     return this.options
   }
 
+  /** Last write failure, or undefined when the registry is in sync with disk. */
+  get lastPersistError(): string | undefined {
+    return this.persistError
+  }
+
   /** Load the registry, tolerating a missing file. */
   async load(): Promise<void> {
     if (this.loaded) return
@@ -125,13 +174,56 @@ export class DeviceStore {
     this.loaded = true
   }
 
-  /** Persist the registry atomically. */
-  private async persist(): Promise<void> {
-    const payload: DeviceFile = { version: 1, devices: this.devices }
-    await mkdir(dirname(this.path), { recursive: true })
-    const temp = `${this.path}.tmp-${randomUUID()}`
-    await writeFile(temp, `${JSON.stringify(payload, null, 2)}\n`, 'utf8')
-    await rename(temp, this.path)
+  /**
+   * Queue one atomic write of the registry.
+   *
+   * Writes are serialised (overlapping temp+rename pairs can collide), the
+   * temp+rename is retried on the transient sharing violations Windows hands out
+   * when a virus scanner or indexer has the file open, and a failure is recorded
+   * rather than thrown: the in-memory registry is authoritative for this process,
+   * so a locked file must degrade durability, never take the service down.
+   *
+   * @returns true when the registry reached disk, false when it only reached memory.
+   */
+  private persist(): Promise<boolean> {
+    const run = async (): Promise<boolean> => {
+      const payload: DeviceFile = { version: 1, devices: this.devices }
+      const body = `${JSON.stringify(payload, null, 2)}\n`
+      await mkdir(dirname(this.path), { recursive: true })
+      const temp = `${this.path}.tmp-${randomUUID()}`
+      try {
+        await writeFile(temp, body, 'utf8')
+        await renameWithRetry(temp, this.path)
+        this.persistError = undefined
+        return true
+      } catch (renameError) {
+        // Never leave a partial temp file behind, then try an in-place write: it
+        // cannot fail on a destination lock the way `rename` can.
+        await rm(temp, { force: true }).catch(() => undefined)
+        try {
+          await writeFile(this.path, body, 'utf8')
+          this.persistError = undefined
+          return true
+        } catch (fallbackError) {
+          // Report the original cause (the fallback usually fails for the same
+          // reason) so the dashboard explains what actually happened.
+          this.persistError = describeWriteError(renameError ?? fallbackError)
+          return false
+        }
+      }
+    }
+    // Chain regardless of the previous outcome so one failure cannot wedge the queue.
+    const next = this.writeQueue.then(run, run)
+    this.writeQueue = next.then(
+      () => undefined,
+      () => undefined,
+    )
+    return next
+  }
+
+  /** Wait for any queued write to settle (used by shutdown and tests). */
+  async flushPendingWrites(): Promise<void> {
+    await this.writeQueue
   }
 
   /** Every device, including revoked and expired ones, newest first. */
@@ -187,6 +279,9 @@ export class DeviceStore {
    * @param input - device name, the raw token, and an optional caller-chosen id
    *   (the pairing service mints it so the phone and the registry agree).
    * @returns the stored record (without the raw token).
+   * @throws when the registry could not be written: a pairing that only exists in
+   *   memory would look successful and then vanish on restart, so it must fail
+   *   loudly here instead.
    */
   async create(input: { name: string; token: string; id?: string; pairedFrom?: string; now?: number }): Promise<DeviceRecord> {
     await this.load()
@@ -201,7 +296,11 @@ export class DeviceStore {
       pairedFrom: input.pairedFrom,
     }
     this.devices.push(record)
-    await this.persist()
+    if (!(await this.persist())) {
+      // Roll the in-memory record back too, so the process agrees with the disk.
+      this.devices = this.devices.filter((device) => device.id !== record.id)
+      throw new Error(`无法写入设备注册表（${this.persistError ?? '未知原因'}）：${this.path}`)
+    }
     return record
   }
 
@@ -225,8 +324,7 @@ export class DeviceStore {
       if (hashEquals(device.tokenHash, hash)) {
         if (this.classify(device, now) !== 'active') {
           // Record only *when* the expiry was first observed; the verdict itself
-          // stays computed from `lastSeenAt`, so an idle device that comes back
-          // before cleanup still authenticates.
+          // stays computed from `lastSeenAt`.
           if (device.revokedAt === undefined && device.expiredAt === undefined) {
             const expired: DeviceRecord = { ...device, expiredAt: now }
             this.devices[index] = expired
@@ -235,9 +333,9 @@ export class DeviceStore {
           return undefined
         }
         // Records are immutable; keep the new timestamp in memory and let the
-        // periodic flush write it, so a busy phone does not rewrite the file
-        // on every single request. A successful use also clears any earlier
-        // expiry stamp — activity makes it stale information.
+        // periodic flush write it, so a busy phone does not rewrite the file on
+        // every single request. A successful use also clears any earlier expiry
+        // stamp — activity makes it stale information.
         const touched: DeviceRecord = { ...device, lastSeenAt: now }
         delete (touched as { expiredAt?: number }).expiredAt
         this.devices[index] = touched

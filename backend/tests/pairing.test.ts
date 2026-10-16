@@ -6,7 +6,7 @@
  */
 
 import { strict as assert } from 'node:assert'
-import { readFile, rm } from 'node:fs/promises'
+import { mkdir, open, readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { DeviceStore, generateToken, hashToken, sanitiseDeviceName } from '../src/auth/devices.ts'
@@ -342,6 +342,75 @@ test('sweep drops dead records only after their retention window', async () => {
     assert.equal(reloaded.list()[0]?.name, '在用的手机')
   } finally {
     await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('a transiently locked registry file is retried, not thrown at the caller', async () => {
+  const dir = await tempDir('dpm-lock-')
+  try {
+    const store = new DeviceStore(dir, { inactivityDays: 30, touchFlushMs: 0 })
+    await store.load()
+    const token = generateToken()
+    const device = await store.create({ name: 'iPhone', token, now: T0 })
+
+    // Windows refuses a rename while another process holds either name open
+    // (virus scanner, indexer, backup agent). This is the failure that used to
+    // surface as an uncaught EPERM and take the whole service down.
+    const handle = await open(join(dir, 'devices.json'), 'r')
+    const release = setTimeout(() => void handle.close(), 150)
+
+    const ok = await store.authenticate(token, T0 + 1_000)
+    assert.equal(ok?.id, device.id, '一次文件占用不该让手机掉线')
+    clearTimeout(release)
+    await handle.close().catch(() => undefined)
+    await store.flushPendingWrites()
+
+    assert.equal(store.lastPersistError, undefined, '重试成功后不该留下错误状态')
+    const reloaded = new DeviceStore(dir, { inactivityDays: 30 })
+    await reloaded.load()
+    assert.equal(reloaded.get(device.id)?.lastSeenAt, T0 + 1_000)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('an unwritable registry degrades durability but never crashes the service', async () => {
+  const dir = await tempDir('dpm-unwritable-')
+  const store = new DeviceStore(dir, { inactivityDays: 30, touchFlushMs: 0 })
+  try {
+    await store.load()
+    const token = generateToken()
+    const first = await store.create({ name: '先绑定的手机', token, now: T0 })
+
+    // Make the registry impossible to replace or overwrite, the way a directory
+    // sitting at the target path would.
+    await rm(join(dir, 'devices.json'), { force: true })
+    await mkdir(join(dir, 'devices.json'))
+
+    // The hot path must still work from memory: a locked file degrades
+    // durability, it does not take the phone offline.
+    assert.equal((await store.authenticate(token, T0 + 1_000))?.id, first.id)
+    await store.flushPendingWrites()
+    assert.ok(store.lastPersistError !== undefined, '写失败必须被记录下来')
+    assert.match(String(store.lastPersistError), /EPERM|EISDIR|EACCES/, String(store.lastPersistError))
+
+    // Pairing, however, must fail loudly: a token that only exists in memory
+    // would look successful and then vanish on restart.
+    await assert.rejects(
+      () => store.create({ name: '写不进去的手机', token: generateToken(), now: T0 + 2_000 }),
+      /无法写入设备注册表/,
+    )
+    assert.equal(store.list().length, 1, '失败的配对不能留在内存里')
+    assert.equal(store.get(first.id)?.name, '先绑定的手机', '已有设备不受影响')
+
+    // A second authentication still works while the file is blocked.
+    assert.equal((await store.authenticate(token, T0 + 3_000))?.id, first.id)
+  } finally {
+    // Let any in-flight write settle before removing the directory; a retried
+    // rename still holding the temp file would otherwise fail the cleanup with
+    // ENOTEMPTY on Windows.
+    await store.flushPendingWrites().catch(() => undefined)
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
   }
 })
 

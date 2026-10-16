@@ -290,12 +290,38 @@ export class MonitorService {
   /** Create the HTTP or HTTPS server, depending on the configured TLS material. */
   private createHttpServer(): Server | HttpsServer {
     const handler = (req: IncomingMessage, res: ServerResponse): void => {
-      void this.handle(req, res)
+      // A rejected request handler must never become an unhandled rejection: that
+      // path shuts the whole service down (observed with a locked device
+      // registry). Answer with a 500 the phone can see instead.
+      this.handle(req, res).catch((error: unknown) => {
+        this.reportInternalError(res, error)
+      })
     }
     const cert = this.config.tlsCertPath
     const key = this.config.tlsKeyPath
     if (cert === undefined || key === undefined) return createServer(handler)
     return createHttpsServer({ cert: readFileSync(cert), key: readFileSync(key) }, handler)
+  }
+
+  /**
+   * Turn an unexpected handler failure into a logged 500.
+   *
+   * @param res - the response being written, if it is still writable.
+   * @param error - whatever was thrown.
+   */
+  private reportInternalError(res: ServerResponse, error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error)
+    // Always log: an unexpected failure is exactly what the operator needs to see.
+    process.stderr.write(`请求处理失败：${error instanceof Error ? error.stack ?? message : message}\n`)
+    if (res.headersSent || res.writableEnded) {
+      res.destroy()
+      return
+    }
+    try {
+      this.sendJson(res, 500, { error: { code: 'internal-error', message: `服务处理该请求时出错：${message}` } })
+    } catch {
+      res.destroy()
+    }
   }
 
   /** Whether this process terminates TLS itself. */
@@ -343,6 +369,7 @@ export class MonitorService {
     this.sweepTimer = undefined
     // Opportunistically persist the batched lastSeenAt values before exiting.
     await this.devices.flushTouches().catch(() => undefined)
+    await this.devices.flushPendingWrites().catch(() => undefined)
     this.pairing.revokeAll()
     this.sse.close()
     for (const handler of this.shutdownHandlers) handler()
@@ -601,6 +628,9 @@ export class MonitorService {
           inactivityDays: this.devices.retention.inactivityDays,
           revokedRetentionDays: this.devices.retention.revokedRetentionDays,
           note: this.sweepTimerNote,
+          // A locked registry file must be visible to the operator: the phone
+          // keeps working from memory, but the change is not durable yet.
+          persistError: this.devices.lastPersistError ?? null,
         },
         sseClients: this.sse.size,
         source: (await this.currentStatus()).source,
@@ -651,12 +681,23 @@ export class MonitorService {
       }
       if (!this.approvedPairingIds.has(decision.deviceId)) {
         this.approvedPairingIds.add(decision.deviceId)
-        await this.devices.create({
-          id: decision.deviceId,
-          name: view.claim?.deviceName ?? '手机',
-          token: decision.token,
-          pairedFrom: view.claim?.claimedFrom,
-        })
+        try {
+          await this.devices.create({
+            id: decision.deviceId,
+            name: view.claim?.deviceName ?? '手机',
+            token: decision.token,
+            pairedFrom: view.claim?.claimedFrom,
+          })
+        } catch (error) {
+          // e.g. the registry file is locked by another process. Report it instead
+          // of handing the phone a token the next restart would forget.
+          this.approvedPairingIds.delete(decision.deviceId)
+          const message = error instanceof Error ? error.message : String(error)
+          this.sendJson(res, 503, {
+            error: { code: 'device-store-unwritable', message: `无法保存设备注册表，请在电脑上确认 data 目录可写后重试。${message}` },
+          })
+          return
+        }
       }
       const stored = this.devices.get(decision.deviceId)
       this.sendJson(res, 200, { status: 'approved', device: stored === undefined ? null : publicDevice(stored) })
@@ -851,12 +892,19 @@ export class MonitorService {
     if (!decision.ok) return false
     if (!this.approvedPairingIds.has(decision.deviceId)) {
       this.approvedPairingIds.add(decision.deviceId)
-      await this.devices.create({
-        id: decision.deviceId,
-        name: decision.deviceName,
-        token: decision.token,
-        pairedFrom: decision.claimedFrom,
-      })
+      try {
+        await this.devices.create({
+          id: decision.deviceId,
+          name: decision.deviceName,
+          token: decision.token,
+          pairedFrom: decision.claimedFrom,
+        })
+      } catch {
+        // Auto-approval only happens on loopback; a failed write means the caller
+        // must retry after fixing the data directory, so report "not approved".
+        this.approvedPairingIds.delete(decision.deviceId)
+        return false
+      }
     }
     return true
   }
