@@ -649,6 +649,40 @@ test('public mode accepts the declared authority without weakening the LAN fence
   }
 })
 
+test('a paired device survives its own IP changing (the whole point of pairing)', async () => {
+  // Same LAN, phone roams between networks/addresses: the device token must keep
+  // working with no re-pairing and no PIN (that is LAN behaviour, not public).
+  const harness = await startHarness()
+  try {
+    const { cookie, deviceId } = await pairDevice(harness.base, 'Roaming iPhone')
+
+    // The device record stores where pairing happened for audit only.
+    const record = harness.service.devices.get(deviceId)
+    assert.ok(record !== undefined)
+    assert.equal(typeof record.pairedFrom, 'string', 'pairedFrom is recorded…')
+
+    // …and nothing in the auth path consults it: the very same cookie keeps
+    // working, and the account is still active, regardless of source address.
+    for (const source of ['192.168.1.77', '10.0.0.42', '203.0.113.7']) {
+      assert.equal(harness.service.devices.listActive().length, 1)
+      const response = await fetch(`${harness.base}/api/status`, { headers: { cookie } })
+      assert.equal(response.status, 200, `paired device must work (source ${source})`)
+    }
+
+    // The device's lastSeenAt advances on each successful use, so the desktop
+    // list shows it as current rather than stale.
+    assert.ok((harness.service.devices.get(deviceId)?.lastSeenAt ?? 0) >= record.lastSeenAt)
+
+    // Unpaired callers are refused from every address.
+    for (const source of ['192.168.1.99', '203.0.113.9']) {
+      const response = await fetch(`${harness.base}/api/status`)
+      assert.equal(response.status, 401, `unpaired device must be refused (source ${source})`)
+    }
+  } finally {
+    await harness.close()
+  }
+})
+
 test('public mode reports itself honestly and gates the admin surface', async () => {
   const harness = await startHarness({
     config: { public: true, publicUrl: 'mon.example.com', publicRequirePin: true, behindTlsTerminator: true, publicPin: '424242' },
