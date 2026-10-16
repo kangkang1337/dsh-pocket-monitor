@@ -9,7 +9,6 @@
  */
 
 import type {
-  ApiError,
   HealthPayload,
   MonitorEvent,
   PendingApproval,
@@ -21,22 +20,52 @@ import type {
 export class ApiFailure extends Error {
   readonly code: string
   readonly status: number
+  /** True when the server needs the public-access PIN before anything else. */
+  readonly pinRequired: boolean
 
-  constructor(status: number, code: string, message: string) {
+  constructor(status: number, code: string, message: string, pinRequired = false) {
     super(message)
     this.name = 'ApiFailure'
     this.status = status
     this.code = code
+    this.pinRequired = pinRequired
+  }
+}
+
+/** Header carrying the public-access PIN (the roaming second factor). */
+const PIN_HEADER = 'x-dsh-pocket-pin'
+
+/** Storage key for the PIN this phone was accepted with. */
+const PIN_STORAGE_KEY = 'dpm.pin.v1'
+
+/** The PIN remembered on this phone, if any. */
+export function rememberedPin(): string | undefined {
+  try {
+    return window.localStorage.getItem(PIN_STORAGE_KEY) ?? undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Remember (or forget) the PIN on this phone. */
+export function rememberPin(pin: string | undefined): void {
+  try {
+    if (pin === undefined || pin === '') window.localStorage.removeItem(PIN_STORAGE_KEY)
+    else window.localStorage.setItem(PIN_STORAGE_KEY, pin)
+  } catch {
+    /* private mode: the PIN just will not persist */
   }
 }
 
 /** Send a JSON request and normalise errors. */
 async function call<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const response = await fetch(path, {
-    credentials: 'same-origin',
-    headers: init.body === undefined ? undefined : { 'content-type': 'application/json' },
-    ...init,
-  })
+  const pin = rememberedPin()
+  const headers: Record<string, string> = { ...((init.headers as Record<string, string> | undefined) ?? {}) }
+  if (init.body !== undefined) headers['content-type'] = 'application/json'
+  // Always send the remembered PIN: on the LAN it is ignored, and when the phone
+  // roams onto the public URL it is what lets the request through.
+  if (pin !== undefined) headers[PIN_HEADER] = pin
+  const response = await fetch(path, { credentials: 'same-origin', ...init, headers })
   const text = await response.text()
   let parsed: unknown
   try {
@@ -45,8 +74,14 @@ async function call<T>(path: string, init: RequestInit = {}): Promise<T> {
     parsed = { raw: text }
   }
   if (!response.ok) {
-    const error = (parsed as Partial<ApiError>).error
-    throw new ApiFailure(response.status, error?.code ?? 'unknown', error?.message ?? `HTTP ${response.status}`)
+    const envelope = parsed as { error?: { code?: string; message?: string; pinRequired?: boolean } }
+    const error = envelope.error
+    throw new ApiFailure(
+      response.status,
+      error?.code ?? 'unknown',
+      error?.message ?? `HTTP ${response.status}`,
+      error?.pinRequired === true || error?.code === 'pin-required' || error?.code === 'pin-not-configured',
+    )
   }
   return parsed as T
 }

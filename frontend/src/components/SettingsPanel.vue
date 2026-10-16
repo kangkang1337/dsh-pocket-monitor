@@ -1,21 +1,29 @@
 <script setup lang="ts">
 /**
- * Settings: device identity, unbinding, LAN addresses, reserved mode B, and a
- * connection diagnosis. Nothing here can start a tunnel or change DSH.
+ * Settings: device identity, unbinding, access scope (LAN or public), the
+ * remembered access PIN, and a connection diagnosis. Nothing here can start a
+ * tunnel or change DSH.
  */
 import { computed, ref } from 'vue'
 import { monitor } from '../stores/monitor.ts'
 import { formatDateTime } from '../utils/format.ts'
-import { api } from '../services/api.ts'
+import { api, rememberedPin } from '../services/api.ts'
 
 const state = monitor.state
 const confirming = ref(false)
 const diagnostics = ref<string[]>([])
 const runningDiagnostics = ref(false)
 const accessUrls = ref<string[]>([])
+const pinRemembered = ref(rememberedPin() !== undefined)
 
 const device = computed(() => state.device)
 const publicAccess = computed(() => state.publicAccess)
+
+/** Drop the remembered PIN so the next public visit asks again. */
+function forgetPin(): void {
+  monitor.forgetPin()
+  pinRemembered.value = false
+}
 
 /** Ask the server which addresses it is reachable on. */
 async function loadAddresses(): Promise<void> {
@@ -94,14 +102,20 @@ async function runDiagnostics(): Promise<void> {
     </div>
 
     <div class="card">
-      <h3 class="card__title">公网访问（模式 B）</h3>
+      <h3 class="card__title">访问范围</h3>
       <p class="card__text">
-        状态：<strong>{{ publicAccess?.mode ?? 'disabled' }}</strong>
+        当前状态：<strong>{{ publicAccess?.mode === 'active' ? '局域网 + 公网' : '仅局域网' }}</strong>
       </p>
+      <p class="card__text muted" v-if="publicAccess?.url">公网域名：{{ publicAccess.url }}</p>
       <p class="card__text muted">{{ publicAccess?.reason }}</p>
       <p class="card__text muted">
-        本版本不会下载、安装或启动任何隧道客户端，也不会修改防火墙或路由器配置；调用启动接口只会得到明确的「尚未实现」。
+        公网模式需要你自备隧道（Cloudflare Tunnel / ngrok / Tailscale / 反向代理）并显式开启；
+        本服务不会下载、安装或启动任何隧道客户端，也不会改防火墙。已配对的设备换网络后仍可访问，
+        未配对的设备一律被拒绝；从公网访问时还需要电脑端生成的访问 PIN。
       </p>
+      <template v-if="pinRemembered">
+        <button class="btn btn--ghost" @click="forgetPin">清除本机记住的访问 PIN</button>
+      </template>
     </div>
 
     <div class="card">

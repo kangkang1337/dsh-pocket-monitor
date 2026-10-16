@@ -34,6 +34,20 @@ export interface MonitorConfig {
   readonly terminalApproval: boolean
   /** Print the access URL and QR block on startup. */
   readonly printQr: boolean
+  /** Enable public-access mode: accept requests on a non-LAN authority. */
+  readonly public: boolean
+  /** The public authority this service is reachable at (host or host:port). */
+  readonly publicUrl?: string
+  /** Operator-chosen access PIN (4-12 digits); generated when omitted. */
+  readonly publicPin?: string
+  /** Whether public requests must present the access PIN. */
+  readonly publicRequirePin: boolean
+  /** Operator confirms a tunnel/reverse proxy terminates TLS in front of us. */
+  readonly behindTlsTerminator: boolean
+  /** TLS certificate path (enables HTTPS when set with {@link tlsKeyPath}). */
+  readonly tlsCertPath?: string
+  /** TLS private-key path. */
+  readonly tlsKeyPath?: string
 }
 
 /** Parsed command-line input for the service. */
@@ -48,6 +62,13 @@ export interface CliOptions {
   readonly trustedOrigins?: readonly string[]
   readonly terminalApproval?: boolean
   readonly printQr?: boolean
+  readonly public?: boolean
+  readonly publicUrl?: string
+  readonly publicPin?: string
+  readonly publicRequirePin?: boolean
+  readonly behindTlsTerminator?: boolean
+  readonly tlsCertPath?: string
+  readonly tlsKeyPath?: string
 }
 
 /** Flags that take a value, so the parser can reject a missing one. */
@@ -60,10 +81,14 @@ const VALUE_FLAGS = new Set([
   '--poll',
   '--pair-ttl',
   '--trusted-origin',
+  '--public-url',
+  '--public-pin',
+  '--tls-cert',
+  '--tls-key',
 ])
 
 /** Boolean flags. */
-const BOOLEAN_FLAGS = new Set(['--no-terminal-approval', '--no-qr'])
+const BOOLEAN_FLAGS = new Set(['--no-terminal-approval', '--no-qr', '--public', '--behind-tls', '--public-no-pin'])
 
 /**
  * Parse monitor-specific flags out of `argv`.
@@ -86,6 +111,13 @@ export function parseCliOptions(argv: readonly string[]): CliOptions {
   const trustedOrigins: string[] = []
   let terminalApproval: boolean | undefined
   let printQr: boolean | undefined
+  let publicMode: boolean | undefined
+  let publicUrl: string | undefined
+  let publicPin: string | undefined
+  let publicRequirePin: boolean | undefined
+  let behindTlsTerminator: boolean | undefined
+  let tlsCertPath: string | undefined
+  let tlsKeyPath: string | undefined
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]
@@ -93,6 +125,9 @@ export function parseCliOptions(argv: readonly string[]): CliOptions {
     if (BOOLEAN_FLAGS.has(arg)) {
       if (arg === '--no-terminal-approval') terminalApproval = false
       if (arg === '--no-qr') printQr = false
+      if (arg === '--public') publicMode = true
+      if (arg === '--behind-tls') behindTlsTerminator = true
+      if (arg === '--public-no-pin') publicRequirePin = false
       continue
     }
     const value = argv[i + 1]
@@ -132,6 +167,20 @@ export function parseCliOptions(argv: readonly string[]): CliOptions {
       case '--trusted-origin':
         trustedOrigins.push(value)
         break
+      case '--public-url':
+        publicUrl = value.trim()
+        break
+      case '--public-pin': {
+        if (!/^\d{4,12}$/.test(value.trim())) throw new Error('--public-pin 必须是 4-12 位数字')
+        publicPin = value.trim()
+        break
+      }
+      case '--tls-cert':
+        tlsCertPath = resolve(value)
+        break
+      case '--tls-key':
+        tlsKeyPath = resolve(value)
+        break
       default:
         break
     }
@@ -148,6 +197,13 @@ export function parseCliOptions(argv: readonly string[]): CliOptions {
     ...(trustedOrigins.length === 0 ? {} : { trustedOrigins }),
     ...(terminalApproval === undefined ? {} : { terminalApproval }),
     ...(printQr === undefined ? {} : { printQr }),
+    ...(publicMode === undefined ? {} : { public: publicMode }),
+    ...(publicUrl === undefined ? {} : { publicUrl }),
+    ...(publicPin === undefined ? {} : { publicPin }),
+    ...(publicRequirePin === undefined ? {} : { publicRequirePin }),
+    ...(behindTlsTerminator === undefined ? {} : { behindTlsTerminator }),
+    ...(tlsCertPath === undefined ? {} : { tlsCertPath }),
+    ...(tlsKeyPath === undefined ? {} : { tlsKeyPath }),
   }
 }
 
@@ -167,6 +223,10 @@ export function resolveConfig(
   const workspace = options.workspace ?? resolve(env.DSH_POCKET_MONITOR_WORKSPACE ?? cwd)
   const dshHome = options.dshHome ?? resolveDshHome(env)
   const dataDir = options.dataDir ?? resolve(cwd, 'data')
+  const publicUrl = options.publicUrl ?? trimmed(env.DSH_POCKET_MONITOR_PUBLIC_URL)
+  const tlsCertPath = options.tlsCertPath ?? pathFromEnv(env.DSH_POCKET_MONITOR_TLS_CERT)
+  const tlsKeyPath = options.tlsKeyPath ?? pathFromEnv(env.DSH_POCKET_MONITOR_TLS_KEY)
+  const publicPin = options.publicPin ?? trimmed(env.DSH_POCKET_MONITOR_PUBLIC_PIN)
   return {
     host: options.host ?? env.DSH_POCKET_MONITOR_HOST ?? '0.0.0.0',
     port: options.port ?? numberFromEnv(env.DSH_POCKET_MONITOR_PORT, 3099),
@@ -179,7 +239,51 @@ export function resolveConfig(
     trustedOrigins: options.trustedOrigins ?? [],
     terminalApproval: options.terminalApproval ?? env.DSH_POCKET_MONITOR_TERMINAL_APPROVAL !== '0',
     printQr: options.printQr ?? env.DSH_POCKET_MONITOR_PRINT_QR !== '0',
+    public: options.public ?? env.DSH_POCKET_MONITOR_PUBLIC === '1',
+    ...(publicUrl === undefined ? {} : { publicUrl }),
+    ...(publicPin === undefined ? {} : { publicPin }),
+    publicRequirePin: options.publicRequirePin ?? env.DSH_POCKET_MONITOR_PUBLIC_PIN_REQUIRED !== '0',
+    behindTlsTerminator: options.behindTlsTerminator ?? env.DSH_POCKET_MONITOR_BEHIND_TLS === '1',
+    ...(tlsCertPath === undefined ? {} : { tlsCertPath }),
+    ...(tlsKeyPath === undefined ? {} : { tlsKeyPath }),
   }
+}
+
+/** Read a trimmed non-empty environment value. */
+function trimmed(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined
+  const value = raw.trim()
+  return value === '' ? undefined : value
+}
+
+/** Read an absolute path from the environment. */
+function pathFromEnv(raw: string | undefined): string | undefined {
+  const value = trimmed(raw)
+  return value === undefined ? undefined : resolve(value)
+}
+
+/**
+ * Reject a public-mode configuration that would expose device tokens in clear
+ * text or leave the instance without a second factor.
+ *
+ * @param config - the resolved configuration.
+ * @returns the list of problems; empty means the configuration is acceptable.
+ */
+export function validatePublicMode(config: MonitorConfig): string[] {
+  const problems: string[] = []
+  if (!config.public) return problems
+  const tls = config.tlsCertPath !== undefined && config.tlsKeyPath !== undefined
+  if (!tls && !config.behindTlsTerminator) {
+    problems.push(
+      '公网模式要求 TLS：要么用 --tls-cert/--tls-key 让本服务自己用 HTTPS，' +
+        '要么在隧道/反向代理后面终止 TLS 并加 --behind-tls 明确确认。' +
+        '明文 HTTP 暴露到公网会让设备令牌在网络上裸奔，所以这里直接拒绝启动。',
+    )
+  }
+  if ((config.tlsCertPath === undefined) !== (config.tlsKeyPath === undefined)) {
+    problems.push('--tls-cert 与 --tls-key 必须成对提供。')
+  }
+  return problems
 }
 
 /** Read a positive integer from the environment with a fallback. */

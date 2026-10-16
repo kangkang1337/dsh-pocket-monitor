@@ -6,6 +6,7 @@ import { onMounted, onUnmounted } from 'vue'
 import { monitor } from './stores/monitor.ts'
 import PairingView from './views/PairingView.vue'
 import MonitorView from './views/MonitorView.vue'
+import PinPrompt from './views/PinPrompt.vue'
 
 const state = monitor.state
 
@@ -19,7 +20,10 @@ onUnmounted(() => {
 
 <template>
   <div class="app">
-    <div class="loading" v-if="state.phase === 'loading'">
+    <!-- A public-network PIN refusal takes priority: nothing else can load. -->
+    <PinPrompt v-if="state.pinRequired" />
+
+    <div class="loading" v-else-if="state.phase === 'loading'">
       <p class="loading__title">正在连接本地监控服务…</p>
       <p class="loading__hint">如果你还没在电脑上启动程序，请先运行 <code>npm run start:lan</code>。</p>
     </div>

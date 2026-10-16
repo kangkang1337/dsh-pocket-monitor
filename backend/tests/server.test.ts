@@ -11,8 +11,9 @@ import { request as httpRequest } from 'node:http'
 import { rm } from 'node:fs/promises'
 import { test } from 'node:test'
 import { DeviceStore } from '../src/auth/devices.ts'
-import { MonitorService } from '../src/server.ts'
-import { getPublicAccessStatus, PublicAccessNotImplementedError, startPublicAccess } from '../src/services/public-access.ts'
+import { MonitorService, classifyRequest } from '../src/server.ts'
+import { validatePublicMode } from '../src/config.ts'
+import { PublicGate } from '../src/services/public-access.ts'
 import { listLanAddresses, classifyInterface, isPrivateAddress, preferredLanAddress } from '../src/services/lan.ts'
 import type { MonitorConfig } from '../src/config.ts'
 import type { MonitorEvent, PendingApproval, StatusPayload } from '../../shared/types/index.ts'
@@ -78,36 +79,74 @@ interface Harness {
   readonly service: MonitorService
   readonly source: FakeSource
   readonly dataDir: string
+  readonly frontendDir: string
   readonly base: string
   close: () => Promise<void>
 }
 
-/** Start a service on an ephemeral loopback port. */
-async function startHarness(options: { pending?: readonly PendingApproval[]; terminalApproval?: boolean; port?: number } = {}): Promise<Harness> {
-  const dataDir = await tempDir('dpm-server-')
-  const frontendDir = await tempDir('dpm-frontend-')
-  const source = new FakeSource(payload({}, options.pending ?? []))
-  const config: MonitorConfig = {
+/** Build a complete MonitorConfig so unrelated fields never break a test. */
+export function makeConfig(overrides: Partial<MonitorConfig> & { dataDir: string }): MonitorConfig {
+  return {
     host: '127.0.0.1',
-    port: options.port ?? 0,
+    port: 0,
     workspace: 'C:\\fake\\ws',
     dshHome: 'C:\\fake\\.dsh',
     pollIntervalMs: 200,
-    dataDir,
     pairTtlSeconds: 300,
     pairMaxAttempts: 8,
     trustedOrigins: [],
-    terminalApproval: options.terminalApproval ?? true,
+    terminalApproval: true,
     printQr: false,
+    public: false,
+    publicRequirePin: true,
+    behindTlsTerminator: false,
+    ...overrides,
   }
+}
+
+/** Start a service on an ephemeral loopback port. */
+async function startHarness(
+  options: { pending?: readonly PendingApproval[]; terminalApproval?: boolean; port?: number; config?: Partial<MonitorConfig> } = {},
+): Promise<Harness> {
+  const dataDir = await tempDir('dpm-server-')
+  const frontendDir = await tempDir('dpm-frontend-')
+  const source = new FakeSource(payload({}, options.pending ?? []))
+  const config = makeConfig({
+    dataDir,
+    port: options.port ?? 0,
+    terminalApproval: options.terminalApproval ?? true,
+    ...options.config,
+  })
   const devices = new DeviceStore(dataDir)
   await devices.load()
-  const service = new MonitorService({ config, source: asSource(source), devices, frontendDir })
+  // Mirror main.ts: build the gate from the config, load its PIN, then inject it.
+  let gate: PublicGate | undefined
+  if (config.public) {
+    gate = new PublicGate({
+      enabled: true,
+      ...(config.publicUrl === undefined ? {} : { publicUrl: config.publicUrl }),
+      tls: config.tlsCertPath !== undefined && config.tlsKeyPath !== undefined,
+      behindTlsTerminator: config.behindTlsTerminator,
+      dataDir,
+      requirePin: config.publicRequirePin,
+      localAuthorities: listLanAddresses().map((entry) => entry.address),
+    })
+    await gate.load()
+    if (config.publicPin !== undefined) await gate.setPin(config.publicPin, false)
+  }
+  const service = new MonitorService({
+    config,
+    source: asSource(source),
+    devices,
+    frontendDir,
+    ...(gate === undefined ? {} : { gate }),
+  })
   const runtime = await service.start()
   return {
     service,
     source,
     dataDir,
+    frontendDir,
     base: `http://127.0.0.1:${runtime.port}`,
     close: async () => {
       await service.stop()
@@ -540,27 +579,281 @@ test('the service exposes no chat, command, or DSH proxy surface', async () => {
   }
 })
 
-test('public-access mode B is reserved, always disabled, and never starts', async () => {
-  const status = getPublicAccessStatus()
-  assert.equal(status.mode, 'disabled')
-  assert.equal(status.configured, false)
-  assert.equal(status.active, false)
-  assert.equal(status.url, null)
-  assert.throws(() => startPublicAccess(), PublicAccessNotImplementedError)
-  assert.throws(() => startPublicAccess(), /尚未实现/)
-
-  // The admin entry point must refuse too, rather than pretending to start a tunnel.
+test('public access stays off until asked, and never auto-starts a tunnel', async () => {
+  // Default (LAN-only) behaviour: the phone path reports disabled.
   const harness = await startHarness()
   try {
     const response = await fetch(`${harness.base}/api/admin/public-access/start`, { method: 'POST' })
     assert.equal(response.status, 501)
-    const body = (await response.json()) as { error: { code: string } }
+    const body = (await response.json()) as { error: { code: string; message: string } }
     assert.equal(body.error.code, 'public_access_not_implemented')
+    assert.match(body.error.message, /不会自动启动公网隧道/)
 
     const { cookie } = await pairDevice(harness.base)
     const readOnly = await fetch(`${harness.base}/api/public-access`, { headers: { cookie } })
     assert.equal(readOnly.status, 200)
-    assert.equal(((await readOnly.json()) as { mode: string }).mode, 'disabled')
+    const status = (await readOnly.json()) as { mode: string; configured: boolean; active: boolean; url: string | null }
+    assert.equal(status.mode, 'disabled')
+    assert.equal(status.active, false)
+    assert.equal(status.url, null)
+    assert.equal(status.configured, false)
+
+    // The status payload must agree with the public-access endpoint.
+    const pay2 = await fetch(`${harness.base}/api/status`, { headers: { cookie } })
+    const payload = (await pay2.json()) as { capabilities: { publicAccess: string } }
+    assert.equal(payload.capabilities.publicAccess, 'disabled')
+  } finally {
+    await harness.close()
+  }
+})
+
+test('a public-mode install refuses to start without TLS', () => {
+  const base = { dataDir: 'C:\\tmp\\x' }
+  const insecure = validatePublicMode(makeConfig({ ...base, public: true }))
+  assert.equal(insecure.length, 1)
+  assert.match(insecure[0] ?? '', /TLS/)
+
+  const halfCert = validatePublicMode(makeConfig({ ...base, public: true, behindTlsTerminator: true, tlsCertPath: 'C:\\tmp\\cert.pem' }))
+  assert.ok(halfCert.some((problem) => problem.includes('成对')))
+
+  const viaTerminator = validatePublicMode(makeConfig({ ...base, public: true, behindTlsTerminator: true }))
+  assert.deepEqual(viaTerminator, [])
+
+  const localTls = validatePublicMode(makeConfig({ ...base, public: true, tlsCertPath: 'C:\\tmp\\cert.pem', tlsKeyPath: 'C:\\tmp\\key.pem' }))
+  assert.deepEqual(localTls, [])
+
+  // Without public mode, TLS is not required.
+  assert.deepEqual(validatePublicMode(makeConfig(base)), [])
+})
+
+test('public mode accepts the declared authority without weakening the LAN fence', async () => {
+  const pin = '424242'
+  const harness = await startHarness({
+    config: { public: true, publicUrl: 'mon.example.com', publicRequirePin: true, behindTlsTerminator: true, publicPin: pin },
+  })
+  try {
+    assert.equal(harness.service.gate.enabled, true)
+    assert.equal(harness.service.gate.hasPin, true, 'enabling public mode must produce an access PIN')
+    assert.equal(harness.service.gate.verifyPin(pin), true)
+
+    // The public authority now passes the fence instead of being refused.
+    const viaPublicHost = await rawStatus(harness.base, '/api/status', { host: 'mon.example.com' })
+    assert.equal(viaPublicHost.status, 401, 'reachable but unauthenticated: 401, never 200')
+    assert.ok(!viaPublicHost.body.includes('currentSessionId'))
+
+    // Unknown authorities stay refused (403 from the fence) even in public mode.
+    const unknown = await rawStatus(harness.base, '/api/status', { host: 'attacker.example.com', 'x-dsh-pocket-pin': pin })
+    assert.equal(unknown.status, 403)
+  } finally {
+    await harness.close()
+  }
+})
+
+test('public mode reports itself honestly and gates the admin surface', async () => {
+  const harness = await startHarness({
+    config: { public: true, publicUrl: 'mon.example.com', publicRequirePin: true, behindTlsTerminator: true, publicPin: '424242' },
+  })
+  try {
+    const { cookie } = await pairDevice(harness.base)
+    const readOnly = await fetch(`${harness.base}/api/public-access`, { headers: { cookie } })
+    assert.equal(readOnly.status, 200)
+    const status = (await readOnly.json()) as { mode: string; active: boolean; url: string | null; reason: string }
+    assert.equal(status.mode, 'active')
+    assert.equal(status.active, true)
+    assert.equal(status.url, 'mon.example.com')
+    assert.match(status.reason, /不会安装或启动任何隧道客户端/)
+
+    // The status payload's capability report agrees with the dedicated endpoint.
+    const payloadResponse = await fetch(`${harness.base}/api/status`, { headers: { cookie } })
+    const payload = (await payloadResponse.json()) as { capabilities: { publicAccess: string; publicAccessReason: string } }
+    assert.equal(payload.capabilities.publicAccess, 'active')
+    assert.match(payload.capabilities.publicAccessReason, /已启用/)
+
+    // Admin routes remain loopback-only, public mode or not.
+    const adminOverLoopback = await fetch(`${harness.base}/api/admin/session`)
+    assert.equal(adminOverLoopback.status, 200)
+  } finally {
+    await harness.close()
+  }
+})
+
+test('the request-purpose matrix decides who must present the access PIN', async () => {
+  const dataDir = await tempDir('dpm-classify-')
+  try {
+    const gate = new PublicGate({
+      enabled: true,
+      publicUrl: 'mon.example.com',
+      tls: false,
+      behindTlsTerminator: true,
+      dataDir,
+      requirePin: true,
+      localAuthorities: ['192.168.1.50'],
+    })
+    const lanHosts = new Set(['127.0.0.1', 'localhost', '192.168.1.50', '10.135.67.100'])
+    const hostAccepts = (hostname: string): boolean => lanHosts.has(hostname)
+    const classify = (remoteAddress: string, host: string) => classifyRequest({ remoteAddress, host, gate, hostAccepts })
+
+    // From this machine: always loopback, whatever the Host says.
+    assert.equal(classify('127.0.0.1', 'mon.example.com'), 'loopback')
+    assert.equal(classify('::ffff:127.0.0.1', 'mon.example.com'), 'loopback')
+    // From the LAN: a local authority stays local, so pairing keeps working.
+    assert.equal(classify('192.168.1.77', '192.168.1.50'), 'lan')
+    assert.equal(classify('192.168.1.77', '10.135.67.100'), 'lan')
+    // From outside: the declared public authority takes the public path.
+    assert.equal(classify('203.0.113.7', 'mon.example.com'), 'public')
+    // From outside with an undeclared authority: the fence refuses it, so it is
+    // never treated as public — the failure stays "401 unpaired".
+    assert.equal(classify('203.0.113.7', 'attacker.example.com'), 'lan')
+    // Public mode off: even the declared authority is not accepted.
+    const offGate = new PublicGate({
+      enabled: false,
+      publicUrl: 'mon.example.com',
+      tls: false,
+      behindTlsTerminator: false,
+      dataDir,
+      requirePin: false,
+      localAuthorities: ['192.168.1.50'],
+    })
+    assert.equal(
+      classifyRequest({ remoteAddress: '203.0.113.7', host: 'mon.example.com', gate: offGate, hostAccepts }),
+      'lan',
+    )
+  } finally {
+    await rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('the gate demands a PIN, throttles guesses, and accepts the right one', async () => {
+  const dataDir = await tempDir('dpm-gate-')
+  try {
+    const gate = new PublicGate({
+      enabled: true,
+      publicUrl: 'mon.example.com',
+      tls: false,
+      behindTlsTerminator: true,
+      dataDir,
+      requirePin: true,
+      localAuthorities: [],
+    })
+    // Loading public mode with no stored PIN generates one and says so.
+    const generated = await gate.load()
+    assert.match(generated ?? '', /^\d{6}$/, 'load() must hand back the generated PIN once')
+    assert.equal(gate.hasPin, true)
+    assert.equal(gate.pinWasGenerated, true)
+
+    // The generated PIN itself works, and a wrong one is refused with a hint.
+    assert.match(generated ?? '', /^\d+$/)
+    assert.equal(gate.checkPublicRequest({ from: '203.0.113.7', pin: generated ?? '' }).ok, true)
+    const wrong = gate.checkPublicRequest({ from: '198.51.100.20', pin: '000000' })
+    assert.equal(wrong.ok, false)
+    if (!wrong.ok) {
+      assert.equal(wrong.status, 401)
+      assert.equal(wrong.pinRequired, true)
+    }
+    assert.equal(gate.checkPublicRequest({ from: '203.0.113.7', pin: generated ?? '' }).ok, true)
+
+    // Brute force from one address must run out of budget.
+    let throttled = false
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const decision = gate.checkPublicRequest({ from: '198.51.100.9', pin: '111111' })
+      if (!decision.ok && decision.status === 429) {
+        throttled = true
+        break
+      }
+    }
+    assert.equal(throttled, true, 'PIN guessing must be throttled')
+
+    // A different address is unaffected by that budget.
+    assert.equal(gate.checkPublicRequest({ from: '198.51.100.10', pin: generated ?? '' }).ok, true)
+
+    // Device-token failures are bounded too, per address and globally.
+    let authLimited = false
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      if (gate.noteAuthFailure('198.51.100.11').limited) {
+        authLimited = true
+        break
+      }
+    }
+    assert.equal(authLimited, true, 'token guessing must be throttled')
+    gate.noteAuthSuccess('198.51.100.11')
+    assert.equal(gate.noteAuthFailure('198.51.100.11').limited, false, 'a success clears the budget')
+  } finally {
+    await rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('requiring no PIN is possible but must be explicit', async () => {
+  const dataDir = await tempDir('dpm-nopin-')
+  try {
+    const gate = new PublicGate({
+      enabled: true,
+      publicUrl: 'mon.example.com',
+      tls: false,
+      behindTlsTerminator: true,
+      dataDir,
+      requirePin: false,
+      localAuthorities: [],
+    })
+    assert.equal(await gate.load(), undefined, 'no PIN is generated when the requirement is off')
+    assert.equal(gate.hasPin, false)
+    assert.equal(gate.checkPublicRequest({ from: '203.0.113.7' }).ok, true)
+    assert.equal(gate.status().mode, 'active')
+    assert.match(gate.status().reason, /未要求访问 PIN/)
+  } finally {
+    await rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('revoking a device cuts off public access immediately', async () => {
+  const pin = '515151'
+  const harness = await startHarness({
+    config: { public: true, publicUrl: 'mon.example.com', publicRequirePin: true, behindTlsTerminator: true, publicPin: pin },
+  })
+  try {
+    const { cookie, deviceId } = await pairDevice(harness.base)
+    // Loopback traffic is never public, so the paired session works locally …
+    const before = await fetch(`${harness.base}/api/status`, { headers: { cookie } })
+    assert.equal(before.status, 200)
+
+    // … and revocation kills that session everywhere at once.
+    const revoke = await fetch(`${harness.base}/api/admin/devices/${deviceId}`, { method: 'DELETE' })
+    assert.equal(revoke.status, 200)
+    const after = await fetch(`${harness.base}/api/status`, { headers: { cookie } })
+    assert.equal(after.status, 401)
+
+    // The same token is also refused through the public authority + PIN.
+    const viaPublic = await rawStatus(harness.base, '/api/status', { host: 'mon.example.com', cookie, 'x-dsh-pocket-pin': pin })
+    assert.equal(viaPublic.status, 401)
+  } finally {
+    await harness.close()
+  }
+})
+
+test('the access PIN can be rotated from the loopback admin API', async () => {
+  const harness = await startHarness({ config: { public: true, publicUrl: 'mon.example.com', behindTlsTerminator: true } })
+  try {
+    const rotated = await fetch(`${harness.base}/api/admin/public-access/pin`, { method: 'POST' })
+    assert.equal(rotated.status, 200)
+    const body = (await rotated.json()) as { pin: string; generated: boolean }
+    assert.match(body.pin, /^\d{6}$/)
+    assert.equal(body.generated, true)
+    assert.equal(harness.service.gate.verifyPin(body.pin), true)
+
+    const custom = await fetch(`${harness.base}/api/admin/public-access/pin`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pin: '987654' }),
+    })
+    assert.equal(custom.status, 200)
+    assert.equal(harness.service.gate.verifyPin('987654'), true)
+    assert.equal(harness.service.gate.verifyPin(body.pin), false, 'the old PIN must stop working')
+
+    const invalid = await fetch(`${harness.base}/api/admin/public-access/pin`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pin: 'abc' }),
+    })
+    assert.equal(invalid.status, 400)
   } finally {
     await harness.close()
   }

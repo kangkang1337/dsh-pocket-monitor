@@ -7,6 +7,7 @@
  */
 
 import type { ServerFrame } from '../../../shared/types/index.ts'
+import { rememberedPin } from './api.ts'
 
 /** Connection state of the phone's own realtime link (not the DSH source). */
 export type LinkState = 'connecting' | 'open' | 'reconnecting' | 'offline' | 'closed'
@@ -19,6 +20,18 @@ export interface StreamHandlers {
 
 /** Reconnect delays in milliseconds; the last value repeats. */
 const BACKOFF_MS = [500, 1_000, 2_000, 4_000, 8_000, 10_000]
+
+/**
+ * Build the stream URL.
+ *
+ * `EventSource` cannot set custom headers, so the public-access PIN travels in a
+ * query parameter here (the backend accepts either). On the LAN the parameter is
+ * ignored.
+ */
+function streamUrl(): string {
+  const pin = rememberedPin()
+  return pin === undefined ? '/api/stream' : `/api/stream?pin=${encodeURIComponent(pin)}`
+}
 
 /**
  * Open the SSE stream and keep it open.
@@ -57,7 +70,7 @@ export function openStream(handlers: StreamHandlers): () => void {
     if (disposed) return
     close()
     setState(attempt === 0 ? 'connecting' : 'reconnecting')
-    const next = new EventSource('/api/stream', { withCredentials: true })
+    const next = new EventSource(streamUrl(), { withCredentials: true })
     source = next
     next.onopen = () => {
       attempt = 0

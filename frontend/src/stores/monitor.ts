@@ -10,7 +10,7 @@
  */
 
 import { computed, readonly, reactive, type ComputedRef } from 'vue'
-import { api, ApiFailure, type ApprovalListing, type PairingProbe } from '../services/api'
+import { api, ApiFailure, rememberPin, type ApprovalListing, type PairingProbe } from '../services/api'
 import { linkLabel, openStream, type LinkState } from '../services/stream'
 import type { MonitorEvent, PendingApproval, PublicAccessStatus, SessionView, StatusPayload } from '../../../shared/types/index.ts'
 
@@ -51,6 +51,13 @@ interface State {
   /** Transient banner message; the UI clears it after showing. */
   notice: string
   busy: boolean
+  /**
+   * Set when the server demands the public-access PIN: the phone moved onto the
+   * public URL and needs the second factor before anything else works.
+   */
+  pinRequired: boolean
+  /** Message shown alongside the PIN prompt. */
+  pinMessage: string
 }
 
 const state = reactive<State>({
@@ -71,6 +78,8 @@ const state = reactive<State>({
   error: '',
   notice: '',
   busy: false,
+  pinRequired: false,
+  pinMessage: '',
 })
 
 let disposeStream: (() => void) | undefined
@@ -152,6 +161,10 @@ export interface MonitorStore {
   clearNotice: () => void
   unbind: () => Promise<void>
   handleLostSession: () => Promise<void>
+  /** Submit the public-access PIN, then retry whatever needed it. */
+  submitPin: (pin: string) => Promise<void>
+  /** Forget the stored PIN (e.g. before re-entering a rotated one). */
+  forgetPin: () => void
   dispose: () => void
 }
 
@@ -190,6 +203,14 @@ export const monitor: MonitorStore = {
       const health = await api.health()
       if (health.ok !== true) throw new Error('本地服务没有就绪')
     } catch (error) {
+      // A PIN refusal is not a service failure — it means this phone reached the
+      // server from another network and needs the second factor.
+      if (error instanceof ApiFailure && error.pinRequired) {
+        state.phase = 'ready'
+        state.pinRequired = true
+        state.pinMessage = error.message
+        return
+      }
       state.phase = 'error'
       state.error = describe(error)
       return
@@ -200,6 +221,12 @@ export const monitor: MonitorStore = {
       await monitor.afterPaired()
       return
     } catch (error) {
+      if (error instanceof ApiFailure && error.pinRequired) {
+        state.phase = 'ready'
+        state.pinRequired = true
+        state.pinMessage = error.message
+        return
+      }
       if (!(error instanceof ApiFailure) || error.status !== 401) {
         state.phase = 'error'
         state.error = describe(error)
@@ -275,6 +302,11 @@ export const monitor: MonitorStore = {
         if (session !== undefined) await monitor.loadTimeline(session.sessionId)
       }
     } catch (error) {
+      if (error instanceof ApiFailure && error.pinRequired) {
+        state.pinRequired = true
+        state.pinMessage = error.message
+        return
+      }
       if (error instanceof ApiFailure && error.status === 401) {
         await monitor.handleLostSession()
         return
@@ -282,6 +314,41 @@ export const monitor: MonitorStore = {
       state.error = describe(error)
       if (state.phase === 'loading') state.phase = 'error'
     }
+  },
+
+  /**
+   * Submit the public-access PIN and re-run whatever needed it.
+   *
+   * The PIN is remembered on this phone for the next time it roams; the server
+   * still re-checks it on every public request.
+   */
+  async submitPin(pin: string): Promise<void> {
+    state.busy = true
+    rememberPin(pin.trim())
+    try {
+      await api.health()
+      state.pinRequired = false
+      state.pinMessage = ''
+      state.phase = 'loading'
+      await monitor.initialise()
+    } catch (error) {
+      if (error instanceof ApiFailure && error.pinRequired) {
+        rememberPin(undefined)
+        state.pinRequired = true
+        state.pinMessage = error.message
+      } else {
+        rememberPin(undefined)
+        state.pinRequired = false
+        state.error = describe(error)
+      }
+    } finally {
+      state.busy = false
+    }
+  },
+
+  /** Forget the remembered PIN. */
+  forgetPin(): void {
+    rememberPin(undefined)
   },
 
   /** Load a session's timeline from the HTTP API (used on tap and first load). */

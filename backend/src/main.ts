@@ -16,8 +16,9 @@ import { fileURLToPath } from 'node:url'
 import { DshSessionSource } from './adapters/dsh/sessions.ts'
 import { DeviceStore } from './auth/devices.ts'
 import { MonitorService } from './server.ts'
-import { parseCliOptions, resolveConfig, type MonitorConfig } from './config.ts'
-import { getPublicAccessStatus } from './services/public-access.ts'
+import { parseCliOptions, resolveConfig, validatePublicMode, type MonitorConfig } from './config.ts'
+import { PublicGate } from './services/public-access.ts'
+import { listLanAddresses } from './services/lan.ts'
 import { runDashboard } from './cli/dashboard.ts'
 
 /** Backend source root, used to locate the built frontend without hard-coded paths. */
@@ -74,6 +75,16 @@ async function main(): Promise<void> {
   const version = await readVersion()
   const frontendDir = await resolveFrontendDir()
 
+  // Refuse an unsafe public exposure before binding anything: device tokens must
+  // never travel in clear text, and the PIN requirement is the second factor that
+  // makes a leaked token alone insufficient.
+  const problems = validatePublicMode(config)
+  if (problems.length > 0) {
+    process.stderr.write(`\n公网模式配置有问题，服务没有启动：\n${problems.map((line) => `  · ${line}`).join('\n')}\n\n`)
+    process.exitCode = 1
+    return
+  }
+
   const devices = new DeviceStore(config.dataDir)
   await devices.load()
   const source = new DshSessionSource({
@@ -81,7 +92,21 @@ async function main(): Promise<void> {
     workspace: config.workspace,
     pollIntervalMs: config.pollIntervalMs,
   })
-  const service = new MonitorService({ config, source, devices, frontendDir })
+
+  const gate = new PublicGate({
+    enabled: config.public,
+    ...(config.publicUrl === undefined ? {} : { publicUrl: config.publicUrl }),
+    tls: config.tlsCertPath !== undefined && config.tlsKeyPath !== undefined,
+    behindTlsTerminator: config.behindTlsTerminator,
+    dataDir: config.dataDir,
+    requirePin: config.publicRequirePin,
+    // Addresses this machine owns stay on the LAN path even in public mode.
+    localAuthorities: [...listLanAddresses().map((entry) => entry.address), config.host],
+  })
+  const generatedPin = await gate.load()
+  if (config.publicPin !== undefined) await gate.setPin(config.publicPin, false)
+
+  const service = new MonitorService({ config, source, devices, frontendDir, gate })
 
   let runtime
   try {
@@ -92,7 +117,7 @@ async function main(): Promise<void> {
     return
   }
 
-  const publicAccess = getPublicAccessStatus()
+  const publicAccess = gate.status()
   process.stdout.write(
     [
       '',
@@ -101,11 +126,29 @@ async function main(): Promise<void> {
       `  工作目录：${config.workspace}`,
       `  监听：${config.host}:${runtime.port}`,
       `  本机地址：http://127.0.0.1:${runtime.port}/`,
-      `  公网访问：${publicAccess.mode}（模式 B 未实现，也不会自动安装隧道）`,
+      `  公网访问：${publicAccess.mode}${publicAccess.url === null ? '' : `  ${publicAccess.url}`}`,
+      `            ${publicAccess.reason}`,
       `  关闭方法：在终端按 Ctrl+C（或在本终端输入 q 回车）`,
       '',
     ].join('\n'),
   )
+
+  if (config.public) {
+    const lines: string[] = ['公网模式已开启：']
+    if (generatedPin !== undefined) {
+      lines.push(`  首次生成访问 PIN：${generatedPin}   ← 手机在新网络首次访问时需要输入`)
+      lines.push('  （已保存到 data/access-pin.json，只存哈希；忘记可用 npm run pin 重新生成）')
+    } else if (gate.hasPin) {
+      lines.push('  访问 PIN 已存在（忘记可用 npm run pin 重新生成）')
+    } else {
+      lines.push('  访问 PIN 未启用：任何拿到设备令牌的客户端都能读取，风险自负（--public-no-pin）')
+    }
+    lines.push(`  公网域名：${config.publicUrl ?? '(未声明，将接受任何非本地 Host)'}`)
+    lines.push('  未配对设备一律 401；已配对设备换网络后仍可访问；撤销设备立即失效。')
+    lines.push('  本服务不安装也不启动任何隧道客户端——请自行用你的隧道工具指向本端口。')
+    lines.push('')
+    process.stdout.write(`${lines.join('\n')}\n`)
+  }
 
   const useDashboard = wantsDashboard()
   let stopping = false

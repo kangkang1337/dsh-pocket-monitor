@@ -328,38 +328,15 @@ export class DshSessionSource {
       const state = watcher.tailer.state
       if (state === undefined) continue
       const { view, timeline } = projectSession(state, now)
-      const pending: PendingApproval[] = []
-      const decided: DecidedApproval[] = []
-      for (const event of state.events) {
-        const data = event.data
-        if (event.type === 'approval/asked') {
-          const id = typeof data.id === 'string' ? data.id : `seq-${event.seq}`
-          pending.push({
-            id,
-            toolName: typeof data.toolName === 'string' ? data.toolName : 'unknown',
-            callId: typeof data.callId === 'string' ? data.callId : undefined,
-            reason: typeof data.reason === 'string' ? data.reason : undefined,
-            sessionId: watcher.sessionId,
-            askedAt: event.time,
-            policy: state.approvalPolicy,
-          })
-        } else if (event.type === 'approval/decided') {
-          const id = typeof data.id === 'string' ? data.id : `seq-${event.seq}`
-          decided.push({
-            id,
-            sessionId: watcher.sessionId,
-            outcome: typeof data.outcome === 'string' ? data.outcome : 'unknown',
-            decidedAt: event.time,
-          })
-        }
-      }
-      const decidedIds = new Set(decided.map((d) => d.id))
-      const stillPending = pending.filter((p) => !decidedIds.has(p.id))
+      // Approvals are maintained incrementally while folding, so an approval asked
+      // more than EVENT_WINDOW events ago is still reported here.
+      const stillPending = [...state.pendingApprovals.values()].sort((a, b) => a.askedAt - b.askedAt)
+      const decided = state.decidedApprovals.slice(-DECIDED_WINDOW)
       sessions.set(watcher.sessionId, {
         state,
         timeline,
         pending: stillPending,
-        decided: decided.slice(-DECIDED_WINDOW),
+        decided,
         formatVersion: watcher.formatVersion,
         newerGenerations: watcher.newerGenerations,
         artifactPath: watcher.path,

@@ -17,6 +17,7 @@ import type {
   SessionView,
   ToolActivity,
 } from '../../../../../shared/types/index.ts'
+import { approvalHintFields } from '../approval-hint.ts'
 
 /** Physical session header as DSH writes it. */
 export interface DshSessionHeader {
@@ -48,6 +49,8 @@ export interface DshSessionArtifact {
 const DETAIL_LIMIT = 220
 /** Events kept per session in memory (newest win). */
 export const EVENT_WINDOW = 400
+/** Decided approvals kept per session for display. */
+export const DECIDED_WINDOW = 20
 /** A session whose log changed within this window counts as live. */
 export const LIVE_WINDOW_MS = 8_000
 
@@ -210,6 +213,16 @@ export interface SessionFoldState {
   permissionPreset?: string
   sandboxMode?: string
   agentPreset?: string
+  /**
+   * Approvals asked but not yet decided.
+   *
+   * Maintained incrementally while folding, NOT derived from {@link events}:
+   * that array is a bounded display window, so scanning it would silently drop
+   * an approval asked more than {@link EVENT_WINDOW} events ago.
+   */
+  pendingApprovals: Map<string, PendingApproval>
+  /** Decided approvals in log order, capped by {@link DECIDED_WINDOW}. */
+  decidedApprovals: DecidedApproval[]
 }
 
 /** Create empty fold state for one decoded header. */
@@ -220,6 +233,8 @@ export function createFoldState(header: DshSessionHeader): SessionFoldState {
     totalEvents: 0,
     lastEventAt: header.createdAt,
     agentPreset: header.agentPreset,
+    pendingApprovals: new Map(),
+    decidedApprovals: [],
   }
 }
 
@@ -275,6 +290,37 @@ export function foldEvent(state: SessionFoldState, event: DshSessionEvent): void
       state.agentPreset = asString(data.preset) ?? state.agentPreset
       break
     }
+    case 'approval/asked': {
+      const id = asString(data.id) ?? `seq-${event.seq}`
+      const toolName = asString(data.toolName) ?? 'unknown'
+      const reason = asString(data.reason)
+      const request: PendingApproval = {
+        id,
+        toolName,
+        callId: asString(data.callId),
+        reason,
+        sessionId: state.header.id,
+        askedAt: event.time,
+        policy: state.approvalPolicy,
+        ...approvalHintFields({ toolName, reason, policy: state.approvalPolicy, sessionId: state.header.id }),
+      }
+      state.pendingApprovals.set(id, request)
+      break
+    }
+    case 'approval/decided': {
+      const id = asString(data.id) ?? `seq-${event.seq}`
+      state.pendingApprovals.delete(id)
+      state.decidedApprovals.push({
+        id,
+        sessionId: state.header.id,
+        outcome: asString(data.outcome) ?? 'unknown',
+        decidedAt: event.time,
+      })
+      if (state.decidedApprovals.length > DECIDED_WINDOW) {
+        state.decidedApprovals.splice(0, state.decidedApprovals.length - DECIDED_WINDOW)
+      }
+      break
+    }
     default:
       break
   }
@@ -306,8 +352,6 @@ export function projectSession(
   const calls = new Map<string, ToolCallRecord>()
   const callOrder: string[] = []
   const timeline: MonitorEvent[] = []
-  const pending = new Map<string, PendingApproval>()
-  const decided: DecidedApproval[] = []
 
   const push = (event: MonitorEvent): void => {
     timeline.push(event)
@@ -464,32 +508,20 @@ export function projectSession(
         break
       }
       case 'approval/asked': {
-        const id = asString(data.id) ?? `seq-${event.seq}`
-        const request: PendingApproval = {
-          id,
-          toolName: asString(data.toolName) ?? 'unknown',
-          callId: asString(data.callId),
-          reason: asString(data.reason),
-          sessionId,
-          askedAt: event.time,
-          policy: state.approvalPolicy,
-        }
-        pending.set(id, request)
+        const toolName = asString(data.toolName) ?? 'unknown'
+        const request = state.pendingApprovals.get(asString(data.id) ?? '')
         push({
           ...base,
           id: `${sessionId}:${event.seq}`,
           kind: 'approval',
           level: 'warn',
-          title: `等待审批：${request.toolName}`,
-          detail: request.reason === undefined ? undefined : oneLine(request.reason),
+          title: `等待审批：${toolName}`,
+          detail: request?.hint ?? (asString(data.reason) === undefined ? undefined : oneLine(asString(data.reason) ?? '')),
         })
         break
       }
       case 'approval/decided': {
-        const id = asString(data.id) ?? `seq-${event.seq}`
         const outcome = asString(data.outcome) ?? 'unknown'
-        pending.delete(id)
-        decided.push({ id, sessionId, outcome, decidedAt: event.time })
         push({
           ...base,
           id: `${sessionId}:${event.seq}`,
@@ -556,7 +588,7 @@ export function projectSession(
   }
   recentTools.reverse()
 
-  const pendingApprovals = [...pending.values()].sort((a, b) => a.askedAt - b.askedAt)
+  const pendingApprovals = [...state.pendingApprovals.values()].sort((a, b) => a.askedAt - b.askedAt)
   const { state: sessionState, reason } = deriveState(state, pendingApprovals.length > 0, now)
   const live = now - state.lastEventAt <= LIVE_WINDOW_MS
 

@@ -173,6 +173,28 @@ export function outcomeText(outcome: string): string {
   }
 }
 
+/** Chinese badge label for what a pending approval is asking for. */
+export function requiredActionLabel(action: string): string {
+  switch (action) {
+    case 'sandbox-escalation':
+      return '沙箱提权'
+    case 'permission':
+      return '权限申请'
+    case 'network-access':
+      return '联网访问'
+    case 'file-access':
+      return '文件访问'
+    case 'read-only-retry':
+      return '需重试确认'
+    case 'tool-permission':
+      return '工具授权'
+    case 'approval-policy':
+      return '审批策略'
+    default:
+      return action
+  }
+}
+
 /** Truncate a title for the session switcher. */
 export function shortTitle(title: string | undefined, fallback: string): string {
   if (title === undefined || title.trim() === '') return fallback

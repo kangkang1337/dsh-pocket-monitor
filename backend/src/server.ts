@@ -14,19 +14,24 @@
  */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { createServer as createHttpsServer, type Server as HttpsServer } from 'node:https'
+import { readFileSync } from 'node:fs'
 import { appendFile, mkdir, readFile, stat } from 'node:fs/promises'
 import { extname, join, normalize, resolve, sep } from 'node:path'
 import { DshSessionSource } from './adapters/dsh/sessions.ts'
 import { hashToken, sanitiseDeviceName, type DeviceRecord, type DeviceStore } from './auth/devices.ts'
 import { PairingService } from './auth/pairing.ts'
 import { listLanAddresses, type LanAddress } from './services/lan.ts'
-import { getPublicAccessStatus } from './services/public-access.ts'
+import { PublicGate, generatePin } from './services/public-access.ts'
 import { SseHub } from './transport/sse.ts'
 import type { MonitorConfig } from './config.ts'
 import type { ApiError, HealthPayload, ServerFrame, StatusPayload } from '../../shared/types/index.ts'
 
 /** Name of the HttpOnly cookie that carries the device token. */
 export const DEVICE_COOKIE = 'dpm_device'
+
+/** Header a public client uses to present the access PIN (second factor). */
+export const PIN_HEADER = 'x-dsh-pocket-pin'
 
 /** How many decision attempts are kept in memory. */
 const DECISION_MEMORY = 200
@@ -84,22 +89,25 @@ export interface MonitorServiceDeps {
   readonly source: DshSessionSource
   readonly devices: DeviceStore
   readonly frontendDir: string
+  /** Public-mode gate; omitted in tests that only exercise LAN behaviour. */
+  readonly gate?: PublicGate
 }
 
 /**
- * The LAN monitor service. `start()` binds the socket; `stop()` closes it,
- * revokes the live pairing code, and drops every realtime stream.
+ * The monitor service. `start()` binds the socket; `stop()` closes it, revokes
+ * the live pairing code, and drops every realtime stream.
  */
 export class MonitorService {
   readonly config: MonitorConfig
   readonly source: DshSessionSource
   readonly devices: DeviceStore
   readonly pairing: PairingService
+  readonly gate: PublicGate
   readonly sse = new SseHub()
   readonly startedAt = Date.now()
 
   private readonly frontendDir: string
-  private server: Server | undefined
+  private server: Server | HttpsServer | undefined
   private pollTimer: NodeJS.Timeout | undefined
   private snapshot: { payload: StatusPayload; at: number } | undefined
   private busy = false
@@ -119,6 +127,16 @@ export class MonitorService {
     this.source = deps.source
     this.devices = deps.devices
     this.frontendDir = deps.frontendDir
+    this.gate =
+      deps.gate ??
+      new PublicGate({
+        enabled: false,
+        tls: false,
+        behindTlsTerminator: false,
+        dataDir: deps.config.dataDir,
+        requirePin: false,
+        localAuthorities: [],
+      })
     this.pairing = new PairingService({
       ttlSeconds: deps.config.pairTtlSeconds,
       maxAttemptsPerIp: deps.config.pairMaxAttempts,
@@ -155,18 +173,19 @@ export class MonitorService {
   async currentStatus(force = false): Promise<StatusPayload> {
     const now = Date.now()
     const interval = Math.max(MIN_POLL_MS, this.config.pollIntervalMs)
-    if (!force && this.snapshot !== undefined && now - this.snapshot.at < interval) return this.snapshot.payload
+    if (!force && this.snapshot !== undefined && now - this.snapshot.at < interval) return withPublicAccess(this.snapshot.payload, this.gate)
     return await this.refresh(force)
   }
 
   /** Force a refresh; concurrent callers share one in-flight pass. */
   private async refresh(_force: boolean): Promise<StatusPayload> {
-    if (this.busy && this.snapshot !== undefined) return this.snapshot.payload
+    if (this.busy && this.snapshot !== undefined) return withPublicAccess(this.snapshot.payload, this.gate)
     this.busy = true
     try {
       const { payload } = await this.source.snapshot()
-      this.snapshot = { payload, at: Date.now() }
-      return payload
+      const merged = withPublicAccess(payload, this.gate)
+      this.snapshot = { payload: merged, at: Date.now() }
+      return merged
     } finally {
       this.busy = false
     }
@@ -179,9 +198,7 @@ export class MonitorService {
     // Mint the first pairing code immediately, so a code exists whether or not an
     // interactive dashboard is attached and the operator never sees an empty QR.
     this.pairing.issue(Date.now(), true)
-    this.server = createServer((req, res) => {
-      void this.handle(req, res)
-    })
+    this.server = this.createHttpServer()
     this.server.on('clientError', (_error, socket) => {
       socket.destroy()
     })
@@ -201,6 +218,22 @@ export class MonitorService {
     }, interval)
     this.pollTimer.unref()
     return this.runtimeInfo()
+  }
+
+  /** Create the HTTP or HTTPS server, depending on the configured TLS material. */
+  private createHttpServer(): Server | HttpsServer {
+    const handler = (req: IncomingMessage, res: ServerResponse): void => {
+      void this.handle(req, res)
+    }
+    const cert = this.config.tlsCertPath
+    const key = this.config.tlsKeyPath
+    if (cert === undefined || key === undefined) return createServer(handler)
+    return createHttpsServer({ cert: readFileSync(cert), key: readFileSync(key) }, handler)
+  }
+
+  /** Whether this process terminates TLS itself. */
+  private get tlsEnabled(): boolean {
+    return this.config.tlsCertPath !== undefined && this.config.tlsKeyPath !== undefined
   }
 
   /** One poll pass: refresh the source and push changes to connected phones. */
@@ -272,8 +305,11 @@ export class MonitorService {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
     const path = url.pathname
     const method = (req.method ?? 'GET').toUpperCase()
+    const purpose = this.requestPurpose(req)
 
     if (path.startsWith('/api/admin/')) {
+      // Admin (pairing confirmation, device revocation) is never reachable from
+      // the public internet, whatever the gate says.
       if (!this.isLoopback(req)) {
         this.sendJson(res, 403, { error: { code: 'loopback-only', message: '管理接口只允许从本机访问。' } })
         return
@@ -281,11 +317,45 @@ export class MonitorService {
       await this.handleAdmin(req, res, method, path)
       return
     }
+
+    if (purpose === 'public') {
+      // `EventSource` cannot attach custom headers, so the SSE stream carries the
+      // PIN in a query parameter; every other request uses the header.
+      const pin = headerValue(req, PIN_HEADER) ?? url.searchParams.get('pin') ?? undefined
+      const decision = this.gate.checkPublicRequest({ from: this.clientIp(req), pin })
+      if (!decision.ok) {
+        this.sendJson(res, decision.status, {
+          error: {
+            code: decision.code,
+            message: decision.message,
+            ...(decision.pinRequired === true ? { pinRequired: true } : {}),
+          },
+        })
+        return
+      }
+    }
+
     if (path.startsWith('/api/')) {
       await this.handleApi(req, res, method, path, url)
       return
     }
     await this.serveStatic(req, res, method, path)
+  }
+
+  /**
+   * Which fence applies to this request: loopback, local network, or public.
+   *
+   * A request is public when its authority is not one this machine owns and not
+   * a private/loopback address. `localhost` and private LAN addresses stay on the
+   * LAN path even when public mode is on, so pairing at home keeps working.
+   */
+  private requestPurpose(req: IncomingMessage): 'loopback' | 'lan' | 'public' {
+    return classifyRequest({
+      remoteAddress: req.socket.remoteAddress ?? '',
+      host: req.headers.host ?? '',
+      gate: this.gate,
+      hostAccepts: (hostname) => this.hostAccepts(hostname),
+    })
   }
 
   /** Public pairing + health routes (no device session required). */
@@ -435,7 +505,7 @@ export class MonitorService {
       return
     }
     if (path.startsWith('/api/public-access') && method === 'GET') {
-      this.sendJson(res, 200, getPublicAccessStatus())
+      this.sendJson(res, 200, this.gate.status())
       return
     }
     this.sendJson(res, 404, { error: { code: 'not-found', message: '没有这个接口。本服务不提供聊天、命令执行或 DSH 代理接口。' } })
@@ -458,7 +528,11 @@ export class MonitorService {
         devices: this.devices.list().map(publicDevice),
         sseClients: this.sse.size,
         source: (await this.currentStatus()).source,
-        publicAccess: getPublicAccessStatus(),
+        publicAccess: this.gate.status(),
+        publicAccessEnabled: this.gate.enabled,
+        publicPinConfigured: this.gate.hasPin,
+        publicPinGenerated: this.gate.pinWasGenerated,
+        tls: this.tlsEnabled,
       })
       return
     }
@@ -529,11 +603,37 @@ export class MonitorService {
       return
     }
     if (path === '/api/admin/public-access/start' && method === 'POST') {
+      // Kept as a permanently-not-implemented endpoint on purpose: this service
+      // must never download, install or start a tunnel client by itself.
       this.sendJson(res, 501, {
         error: {
           code: 'public_access_not_implemented',
-          message: '公网访问（模式 B）尚未实现：本版本只支持 LAN，且不会自动安装或启动任何隧道客户端。',
+          message:
+            '本服务不会自动启动公网隧道（不下载、不安装、不改防火墙）。' +
+            '请自行准备隧道或反向代理，然后用 --public 与 --public-url 接入。',
         },
+        publicAccess: this.gate.status(),
+      })
+      return
+    }
+    if (path === '/api/admin/public-access/pin' && method === 'POST') {
+      const body = await this.readJsonBody(req, res)
+      if (body === undefined) return
+      const requested = stringField(body, 'pin')
+      const pin = requested ?? generatePin()
+      try {
+        await this.gate.setPin(pin, requested === undefined)
+      } catch (error) {
+        this.sendJson(res, 400, { error: { code: 'invalid-pin', message: error instanceof Error ? error.message : 'PIN 不合法。' } })
+        return
+      }
+      // The PIN is printed, never returned over the wire unless loopback asked for
+      // it explicitly — and this whole endpoint is loopback-only anyway.
+      process.stdout.write(`\n新的公网访问 PIN：${pin}（${requested === undefined ? '自动生成' : '由你指定'}）\n`)
+      this.sendJson(res, 200, {
+        pin,
+        generated: requested === undefined,
+        hint: '在手机页面输入这个 PIN 即可继续访问（每台设备、每个新网络只需输一次）。',
       })
       return
     }
@@ -621,8 +721,10 @@ export class MonitorService {
         toolName: pending.toolName,
         sessionId: pending.sessionId,
         action,
+        requiredAction: pending.requiredAction ?? null,
+        hint: pending.hint ?? null,
       },
-      nextStep: '请在运行 DSH 的那台电脑上操作：Web GUI 的审批面板（或终端里的审批提示）才是 DSH 真正接受的应答者。手机端会在日志里看到结果变化。',
+      nextStep: `请在运行 DSH 的那台电脑上操作：${pending.hint ?? 'Web GUI 的审批面板或终端里的审批提示'} 手机端会在日志里看到结果变化。`,
       recordedLocally: true,
       deliveredToDsh: false,
     }
@@ -703,8 +805,30 @@ export class MonitorService {
 
   // ───────────────────────────── helpers ─────────────────────────────
 
-  /** Resolve the device session from the cookie or a bearer token. */
+  /**
+   * Resolve the device session from the cookie or a bearer token.
+   *
+   * The token is what makes a phone recognised from *any* network: nothing here
+   * depends on the source address, so a paired phone keeps working after moving
+   * between Wi-Fi and cellular. Public requests additionally need the access PIN,
+   * which the router already checked before this runs.
+   */
   private async authenticate(req: IncomingMessage): Promise<DeviceRecord | undefined> {
+    const device = await this.resolveDevice(req)
+    const ip = this.clientIp(req)
+    if (device !== undefined) {
+      this.gate.noteAuthSuccess(ip)
+      return device
+    }
+    if (this.requestPurpose(req) === 'public') {
+      const failure = this.gate.noteAuthFailure(ip)
+      if (failure.limited) return undefined
+    }
+    return undefined
+  }
+
+  /** Look up the device from the bearer token or the device cookie. */
+  private async resolveDevice(req: IncomingMessage): Promise<DeviceRecord | undefined> {
     const header = req.headers.authorization
     if (typeof header === 'string' && header.toLowerCase().startsWith('bearer ')) {
       return await this.devices.authenticate(header.slice(7).trim())
@@ -717,8 +841,7 @@ export class MonitorService {
 
   /** Whether a request came from this machine. */
   private isLoopback(req: IncomingMessage): boolean {
-    const address = req.socket.remoteAddress ?? ''
-    return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'
+    return isLoopbackAddress(req.socket.remoteAddress ?? '')
   }
 
   /** Best-effort client identity for rate limiting and audit. */
@@ -758,6 +881,9 @@ export class MonitorService {
     // A requested bind host of 0.0.0.0 means "whatever address a phone types";
     // the device cookie and Origin check remain the actual authorisation.
     if (this.config.host === '0.0.0.0' && isPrivateIpv4(normalised)) return true
+    // Public mode makes the declared authority reachable; `requestPurpose` then
+    // routes it onto the public path, where the PIN and device token decide.
+    if (this.gate.isPublicAuthority(hostname)) return true
     return false
   }
 
@@ -808,9 +934,10 @@ export class MonitorService {
 
   /** Set the device cookie bound to the request's authority. */
   private setDeviceCookie(res: ServerResponse, req: IncomingMessage, token: string): void {
-    const secure = 'HttpOnly; SameSite=Strict; Path=/'
-    void req
-    res.setHeader('set-cookie', `${DEVICE_COOKIE}=${token}; ${secure}; Max-Age=${30 * 24 * 3600}`)
+    // `Secure` only when the request actually arrived over TLS; marking it Secure
+    // on the LAN's plain HTTP would make the cookie unusable.
+    const secure = this.tlsEnabled || isHttpsRequest(req) ? '; Secure' : ''
+    res.setHeader('set-cookie', `${DEVICE_COOKIE}=${token}; HttpOnly; SameSite=Strict; Path=/${secure}; Max-Age=${30 * 24 * 3600}`)
   }
 
   /** Clear the device cookie. */
@@ -866,9 +993,64 @@ export class MonitorService {
   }
 }
 
-/** Public projection of a device record (never includes the token hash). */
-export function publicDevice(device: DeviceRecord): Record<string, unknown> {
+/**
+ * Decide which fence a request belongs to.
+ *
+ * Kept pure and exported so the decision matrix can be tested directly: whether
+ * a request counts as "public" decides whether the access PIN is demanded, and
+ * that must not depend on being able to fake a foreign socket in a test.
+ *
+ * @param input - observed remote address, `Host` header, gate, and the local
+ *   authority test used for the LAN fence.
+ * @returns `loopback`, `lan`, or `public`.
+ */
+export function classifyRequest(input: {
+  remoteAddress: string
+  host: string
+  gate: PublicGate
+  hostAccepts: (hostname: string) => boolean
+}): 'loopback' | 'lan' | 'public' {
+  if (isLoopbackAddress(input.remoteAddress)) return 'loopback'
+  if (input.host === '') return 'lan'
+  // Public is checked first: a declared public authority must take the public
+  // path (and therefore the PIN requirement) even though the fence also accepts
+  // it as a reachable authority.
+  if (input.gate.isPublicAuthority(input.host)) return 'public'
+  if (input.hostAccepts(stripPort(input.host))) return 'lan'
+  // Anything else already failed the fence; treat it as LAN so the failure mode
+  // stays "401 unpaired" rather than leaking the public-mode machinery.
+  return 'lan'
+}
+
+/** Whether a socket address is this machine's own loopback interface. */
+export function isLoopbackAddress(address: string): boolean {
+  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'
+}
+
+/**
+ * Project the live public-access state into a status payload's capabilities.
+ *
+ * The adapter owns the DSH-facing capabilities; the service owns this one,
+ * because only it knows whether public mode was switched on.
+ *
+ * @param payload - the adapter's payload.
+ * @param gate - the public-access gate.
+ * @returns the same payload with `capabilities.publicAccess*` refreshed.
+ */
+export function withPublicAccess(payload: StatusPayload, gate: PublicGate): StatusPayload {
+  const status = gate.status()
   return {
+    ...payload,
+    capabilities: {
+      ...payload.capabilities,
+      publicAccess: status.mode === 'active' ? 'active' : 'disabled',
+      publicAccessReason: status.reason,
+    },
+  }
+}
+
+/** Public projection of a device record (never includes the token hash). */
+export function publicDevice(device: DeviceRecord): Record<string, unknown> {  return {
     id: device.id,
     name: device.name,
     scopes: device.scopes,
@@ -902,6 +1084,22 @@ function stripPort(authority: string): string {
   }
   const colon = trimmed.lastIndexOf(':')
   return colon === -1 ? trimmed : trimmed.slice(0, colon)
+}
+
+/** Read one request header as a trimmed string. */
+function headerValue(req: IncomingMessage, name: string): string | undefined {
+  const raw = req.headers[name]
+  const value = Array.isArray(raw) ? raw[0] : raw
+  if (value === undefined) return undefined
+  const trimmed = value.trim()
+  return trimmed === '' ? undefined : trimmed
+}
+
+/** Whether the request reached this process over HTTPS (directly or via a proxy). */
+function isHttpsRequest(req: IncomingMessage): boolean {
+  if ((req.socket as { encrypted?: boolean }).encrypted === true) return true
+  const forwarded = headerValue(req, 'x-forwarded-proto')
+  return forwarded !== undefined && forwarded.split(',')[0]?.trim().toLowerCase() === 'https'
 }
 
 /** Whether an IPv4 literal is private/CGNAT (used only for the 0.0.0.0 bind case). */

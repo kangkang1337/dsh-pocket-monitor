@@ -50,6 +50,20 @@ export interface PendingApproval {
   readonly askedAt: number
   /** The effective approval policy at the time of reading, when the log states it. */
   readonly policy?: string
+  /**
+   * What kind of permission or decision this request represents, derived from
+   * the recorded reason + tool (see `backend/src/adapters/dsh/approval-hint.ts`).
+   */
+  readonly requiredAction?:
+    | 'sandbox-escalation'
+    | 'permission'
+    | 'network-access'
+    | 'file-access'
+    | 'read-only-retry'
+    | 'tool-permission'
+    | 'approval-policy'
+  /** One actionable sentence telling the operator what DSH is asking for. */
+  readonly hint?: string
 }
 
 /** An approval whose decision has been recorded in the log. */
@@ -170,18 +184,21 @@ export interface Capabilities {
   /** False while DSH offers no external approval channel for this build. */
   readonly approvalDeciding: boolean
   readonly approvalDecidingReason: string
-  readonly publicAccess: 'disabled'
+  /** `active` when the opt-in public mode is on; `disabled` otherwise. */
+  readonly publicAccess: 'disabled' | 'active'
   readonly publicAccessReason: string
   readonly chat: false
   readonly commandExecution: false
 }
 
-/** Public-access (mode B) status: reserved interface, never implemented in v1. */
+/** Public-access (mode B) status. Switching it on is an explicit opt-in. */
 export interface PublicAccessStatus {
   readonly mode: 'disabled' | 'starting' | 'active' | 'stopping' | 'error'
-  readonly configured: false
-  readonly active: false
-  readonly url: null
+  /** True when the operator declared the public authority (`--public-url`). */
+  readonly configured: boolean
+  readonly active: boolean
+  /** The public URL, once known. */
+  readonly url: string | null
   readonly reason: string
 }
 
