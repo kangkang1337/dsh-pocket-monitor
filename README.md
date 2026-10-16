@@ -175,7 +175,7 @@ curl -X DELETE http://127.0.0.1:3099/api/admin/devices/<设备id>
 
 1. **先确认服务在跑**：电脑上打开 <http://127.0.0.1:3099/> 能看到界面。
 2. **确认手机和电脑在同一网段**：电脑 `ipconfig` 看 WLAN 的 IPv4（例如 `192.168.1.23`）；手机 Wi-Fi 详情里看 IP，前三段应该一致。
-3. **确认连的是正确的地址**：必须用电脑终端里打印的那个地址；`VMware`/`VirtualBox`/`WSL` 的虚拟网卡地址（例如 `192.168.184.1`、`172.16.0.1` 这类）手机连不上，不要用。虚拟网卡地址在终端里会标着 `virtual`，优先用标 `wifi` 的那个。
+3. **确认连的是正确的地址**：必须用电脑终端里打印的那个地址；`VMware`/`VirtualBox`/`WSL` 的虚拟网卡地址（例如 `192.168.184.1`、`172.16.0.1` 这类）手机连不上，不要用。虚拟网卡地址在终端里会标着 `virtual`，优先用标着 `wifi` 的那个。
 4. **放行端口**（在**管理员** PowerShell 里执行一次即可，本项目不会自动改防火墙）：
    ```powershell
    New-NetFirewallRule -DisplayName "DSH Pocket Monitor (LAN)" -Direction Inbound -Action Allow `
