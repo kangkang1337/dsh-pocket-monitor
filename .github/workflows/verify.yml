@@ -1,0 +1,51 @@
+# 每次 push / PR 都在干净的 Windows 环境里跑一遍真实检查。
+#
+# 这里跑的是仓库里本来就有的脚本，没有为 CI 另写一套逻辑：
+#   npm test          —— 单进程测试运行器（不依赖子进程管道，任何环境都能跑）
+#   npm run typecheck —— 前后端类型检查
+#   e2e-check.ts      —— 真起服务、真配对的端到端自检
+#   lock-check.ts     —— 注册表被占用时的降级自检（防止 EPERM 崩溃回归）
+#   proxy-check.ts    —— 同机隧道不得冒充本机操作者的安全回归
+name: verify
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 类型检查（前后端）
+        run: npm run typecheck
+
+      - name: 单元测试
+        run: npm test
+
+      - name: 构建前端（e2e 需要 dist）
+        run: npm run build:frontend
+
+      - name: 端到端自检
+        run: node --experimental-strip-types scripts/e2e-check.ts
+
+      - name: 设备注册表故障自检
+        run: node --experimental-strip-types scripts/lock-check.ts
+
+      - name: 同机代理信任边界自检
+        run: node --experimental-strip-types scripts/proxy-check.ts

@@ -33,6 +33,13 @@ export const DEVICE_COOKIE = 'dpm_device'
 
 /** Header a public client uses to present the access PIN (second factor). */
 export const PIN_HEADER = 'x-dsh-pocket-pin'
+/**
+ * Cookie carrying the verified public-access PIN.
+ *
+ * Used instead of a URL parameter so the PIN cannot end up in tunnel logs,
+ * browser history, or `Referer` headers when `EventSource` cannot set headers.
+ */
+export const PIN_COOKIE = 'dpm_pin'
 
 /** How many decision attempts are kept in memory. */
 const DECISION_MEMORY = 200
@@ -407,19 +414,39 @@ export class MonitorService {
 
     if (path.startsWith('/api/admin/')) {
       // Admin (pairing confirmation, device revocation) is never reachable from
-      // the public internet, whatever the gate says.
-      if (!this.isLoopback(req)) {
-        this.sendJson(res, 403, { error: { code: 'loopback-only', message: '管理接口只允许从本机访问。' } })
+      // the public internet, whatever the gate says. `isLocalOperator` is what
+      // makes that true behind a same-machine tunnel, where every remote request
+      // also arrives from a loopback socket.
+      if (!this.isLocalOperator(req)) {
+        this.sendJson(res, 403, {
+          error: {
+            code: 'loopback-only',
+            message: this.gate.isPublicAuthority(req.headers.host ?? '')
+              ? '管理接口只允许直接在本机访问；这条请求带着公网域名（说明它经过了隧道或反向代理），因此被拒绝。'
+              : '管理接口只允许从本机直接访问（不接受代理转发的请求）。',
+          },
+        })
         return
       }
       await this.handleAdmin(req, res, method, path)
       return
     }
 
-    if (purpose === 'public') {
+    // Static assets are served without the PIN gate: the PIN prompt is itself a
+    // page in that bundle, so gating `/` would answer with JSON before the phone
+    // could ever show an input box. Every *data* route below still needs the PIN
+    // and a device token, so serving the shell leaks nothing.
+    const isDataRoute = path.startsWith('/api/')
+
+    if (purpose === 'public' && isDataRoute) {
       // `EventSource` cannot attach custom headers, so the SSE stream carries the
-      // PIN in a query parameter; every other request uses the header.
-      const pin = headerValue(req, PIN_HEADER) ?? url.searchParams.get('pin') ?? undefined
+      // second factor in a cookie rather than a query parameter (a URL lands in
+      // proxy logs and browser history). Older clients may still send `?pin=`.
+      const pin =
+        headerValue(req, PIN_HEADER) ??
+        parseCookies(req.headers.cookie ?? '').dpm_pin ??
+        url.searchParams.get('pin') ??
+        undefined
       const decision = this.gate.checkPublicRequest({ from: this.clientIp(req), pin })
       if (!decision.ok) {
         this.sendJson(res, decision.status, {
@@ -431,13 +458,35 @@ export class MonitorService {
         })
         return
       }
+      // Trade the PIN for a short-lived second-factor cookie so later requests
+      // (including the SSE stream) do not have to resend it.
+      if (headerValue(req, PIN_HEADER) !== undefined) this.setPinCookie(res, req)
     }
 
-    if (path.startsWith('/api/')) {
+    if (isDataRoute) {
       await this.handleApi(req, res, method, path, url)
       return
     }
     await this.serveStatic(req, res, method, path)
+  }
+
+  /**
+   * Bind the verified second factor to a cookie scoped to this authority.
+   *
+   * A cookie (not a URL parameter) keeps the PIN out of tunnel logs, and it is
+   * re-verified on every request — it carries the same value the header would.
+   *
+   * @param res - response receiving the cookie.
+   * @param req - the request that carried the verified PIN.
+   */
+  private setPinCookie(res: ServerResponse, req: IncomingMessage): void {
+    const pin = headerValue(req, PIN_HEADER)
+    if (pin === undefined) return
+    const secure = this.tlsEnabled || isHttpsRequest(req) ? '; Secure' : ''
+    const existing = res.getHeader('set-cookie')
+    const cookie = `${PIN_COOKIE}=${pin}; HttpOnly; SameSite=Strict; Path=/${secure}; Max-Age=${12 * 3600}`
+    if (existing === undefined) res.setHeader('set-cookie', cookie)
+    else res.setHeader('set-cookie', [...(Array.isArray(existing) ? existing : [String(existing)]), cookie])
   }
 
   /**
@@ -453,6 +502,7 @@ export class MonitorService {
       host: req.headers.host ?? '',
       gate: this.gate,
       hostAccepts: (hostname) => this.hostAccepts(hostname),
+      proxied: looksProxied(req.headers),
     })
   }
 
@@ -502,7 +552,11 @@ export class MonitorService {
       }
       // A claim from this machine itself is the operator sitting at the console:
       // approve it immediately, unless terminal approval was turned off.
-      if (this.isLoopback(req) && this.config.terminalApproval) await this.approveThroughLoopback(result.pairingId)
+      // Auto-confirmation is an operator convenience for a phone on the same
+      // machine. It must never fire for a request that a local tunnel could have
+      // forwarded, or a remote attacker holding the pairing code would be
+      // confirmed automatically.
+      if (this.isLocalOperator(req) && this.config.terminalApproval) await this.approveThroughLoopback(result.pairingId)
       this.sendJson(res, 202, { pairingId: result.pairingId, state: 'pending' })
       return true
     }
@@ -968,14 +1022,50 @@ export class MonitorService {
     return await this.devices.authenticate(token)
   }
 
-  /** Whether a request came from this machine. */
-  private isLoopback(req: IncomingMessage): boolean {
-    return isLoopbackAddress(req.socket.remoteAddress ?? '')
+  /**
+   * Whether a request is the local operator sitting at this machine.
+   *
+   * Deliberately stricter than "the socket came from loopback": with a tunnel or
+   * reverse proxy running here, every remote caller also arrives over loopback.
+   * Local-operator powers (admin routes, auto-confirming a pairing) therefore
+   * require loopback *and* the absence of proxy evidence.
+   *
+   * @param req - the incoming request.
+   * @returns true only for a request that cannot have been forwarded.
+   */
+  private isLocalOperator(req: IncomingMessage): boolean {
+    if (!isLoopbackAddress(req.socket.remoteAddress ?? '')) return false
+    if (looksProxied(req.headers)) return false
+    // A request that names our public authority is foreign by construction: the
+    // only way it reaches a loopback socket is through something that accepted a
+    // remote connection first.
+    if (this.gate.isPublicAuthority(req.headers.host ?? '')) return false
+    return true
   }
 
-  /** Best-effort client identity for rate limiting and audit. */
+  /**
+   * Best-effort client identity for rate limiting and audit.
+   *
+   * `X-Forwarded-For` is only consulted when the operator declared the peer as a
+   * trusted proxy (`--trust-proxy`); otherwise a remote caller could forge the
+   * header and hand itself a fresh rate-limit budget.
+   *
+   * @param req - the incoming request.
+   * @returns an address-like string for logs and limiters.
+   */
   private clientIp(req: IncomingMessage): string {
-    return req.socket.remoteAddress ?? 'unknown'
+    const peer = req.socket.remoteAddress ?? 'unknown'
+    if (!this.isTrustedProxyAddress(peer)) return peer
+    const forwarded = headerValue(req, 'x-forwarded-for')
+    if (forwarded === undefined) return peer
+    // Right-most entry is the one appended by the proxy closest to us.
+    const parts = forwarded.split(',').map((part) => part.trim()).filter((part) => part !== '')
+    return parts[parts.length - 1] ?? peer
+  }
+
+  /** Whether an address was declared a trusted reverse proxy. */
+  private isTrustedProxyAddress(address: string): boolean {
+    return this.config.trustedProxies.includes(address)
   }
 
   /** Host/Origin fence: DNS-rebinding and cross-site protection. */
@@ -1138,17 +1228,62 @@ export function classifyRequest(input: {
   host: string
   gate: PublicGate
   hostAccepts: (hostname: string) => boolean
+  /**
+   * Whether the request carries evidence of having been forwarded by a proxy.
+   *
+   * A loopback socket only proves the request came *from this machine*; when a
+   * tunnel or reverse proxy runs here, that includes every remote caller. So a
+   * loopback request that shows proxy evidence must not take the loopback path.
+   */
+  proxied?: boolean
 }): 'loopback' | 'lan' | 'public' {
-  if (isLoopbackAddress(input.remoteAddress)) return 'loopback'
+  const fromThisMachine = isLoopbackAddress(input.remoteAddress)
+  if (fromThisMachine && input.proxied !== true) return 'loopback'
   if (input.host === '') return 'lan'
   // Public is checked first: a declared public authority must take the public
   // path (and therefore the PIN requirement) even though the fence also accepts
-  // it as a reachable authority.
+  // it as a reachable authority. This is what makes a same-machine tunnel safe:
+  // its requests keep the public `Host`, so they land here instead of loopback.
   if (input.gate.isPublicAuthority(input.host)) return 'public'
   if (input.hostAccepts(stripPort(input.host))) return 'lan'
   // Anything else already failed the fence; treat it as LAN so the failure mode
   // stays "401 unpaired" rather than leaking the public-mode machinery.
   return 'lan'
+}
+
+/**
+ * Headers that indicate a request reached us through a proxy or tunnel.
+ *
+ * Presence is treated as evidence regardless of `--trust-proxy`: the header may
+ * be forged, but a forged one only ever makes us *stricter* (the loopback paths
+ * that would be bypassed here are the ones an attacker would want), so treating
+ * it as a signal cannot be turned against us.
+ */
+const PROXY_HEADERS = [
+  'x-forwarded-for',
+  'x-forwarded-host',
+  'x-forwarded-proto',
+  'x-real-ip',
+  'forwarded',
+  'cf-connecting-ip',
+  'cf-ray',
+  'x-vercel-forwarded-for',
+  'true-client-ip',
+] as const
+
+/**
+ * Whether a request carries proxy/tunnel evidence.
+ *
+ * @param headers - the incoming request headers.
+ * @returns true when any forwarding header is present.
+ */
+export function looksProxied(headers: IncomingMessage['headers']): boolean {
+  for (const name of PROXY_HEADERS) {
+    const value = headers[name]
+    if (typeof value === 'string' && value.trim() !== '') return true
+    if (Array.isArray(value) && value.some((entry) => entry.trim() !== '')) return true
+  }
+  return false
 }
 
 /** Whether a socket address is this machine's own loopback interface. */

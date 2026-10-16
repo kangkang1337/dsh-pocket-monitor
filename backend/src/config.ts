@@ -46,6 +46,14 @@ export interface MonitorConfig {
   readonly watchAll: boolean
   /** Cap on watched sessions when `watchAll` is on. */
   readonly maxSessions: number
+  /**
+   * Addresses whose `X-Forwarded-For` may be believed for rate limiting.
+   *
+   * The *presence* of a forwarding header always counts as "this request was
+   * proxied" (that only makes checks stricter); this list additionally decides
+   * whether the forwarded address may be used as the client identity.
+   */
+  readonly trustedProxies: readonly string[]
   /** Enable public-access mode: accept requests on a non-LAN authority. */
   readonly public: boolean
   /** The public authority this service is reachable at (host or host:port). */
@@ -72,6 +80,7 @@ export interface CliOptions {
   readonly pollIntervalMs?: number
   readonly pairTtlSeconds?: number
   readonly trustedOrigins?: readonly string[]
+  readonly trustedProxies?: readonly string[]
   readonly terminalApproval?: boolean
   readonly printQr?: boolean
   readonly public?: boolean
@@ -102,6 +111,7 @@ const VALUE_FLAGS = new Set([
   '--tls-key',
   '--device-ttl',
   '--max-sessions',
+  '--trust-proxy',
 ])
 
 /** Boolean flags. */
@@ -126,6 +136,7 @@ export function parseCliOptions(argv: readonly string[]): CliOptions {
   let pollIntervalMs: number | undefined
   let pairTtlSeconds: number | undefined
   const trustedOrigins: string[] = []
+  const trustedProxies: string[] = []
   let terminalApproval: boolean | undefined
   let printQr: boolean | undefined
   let publicMode: boolean | undefined
@@ -196,6 +207,9 @@ export function parseCliOptions(argv: readonly string[]): CliOptions {
       case '--trusted-origin':
         trustedOrigins.push(value)
         break
+      case '--trust-proxy':
+        trustedProxies.push(value)
+        break
       case '--public-url':
         publicUrl = value.trim()
         break
@@ -230,6 +244,7 @@ export function parseCliOptions(argv: readonly string[]): CliOptions {
     ...(pollIntervalMs === undefined ? {} : { pollIntervalMs }),
     ...(pairTtlSeconds === undefined ? {} : { pairTtlSeconds }),
     ...(trustedOrigins.length === 0 ? {} : { trustedOrigins }),
+    ...(trustedProxies.length === 0 ? {} : { trustedProxies }),
     ...(terminalApproval === undefined ? {} : { terminalApproval }),
     ...(printQr === undefined ? {} : { printQr }),
     ...(publicMode === undefined ? {} : { public: publicMode }),
@@ -275,6 +290,7 @@ export function resolveConfig(
     pairTtlSeconds: options.pairTtlSeconds ?? numberFromEnv(env.DSH_POCKET_MONITOR_PAIR_TTL, 300),
     pairMaxAttempts: numberFromEnv(env.DSH_POCKET_MONITOR_PAIR_ATTEMPTS, 8),
     trustedOrigins: options.trustedOrigins ?? [],
+    trustedProxies: options.trustedProxies ?? [],
     terminalApproval: options.terminalApproval ?? env.DSH_POCKET_MONITOR_TERMINAL_APPROVAL !== '0',
     printQr: options.printQr ?? env.DSH_POCKET_MONITOR_PRINT_QR !== '0',
     public: options.public ?? env.DSH_POCKET_MONITOR_PUBLIC === '1',

@@ -5,7 +5,7 @@
  */
 
 import { strict as assert } from 'node:assert'
-import { rm, stat, writeFile } from 'node:fs/promises'
+import { rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { zstdCompressSync, constants } from 'node:zlib'
@@ -420,14 +420,18 @@ test('watch-all follows every workspace and tags each session with its own cwd',
 test('watch-all caps the number of tailed sessions and says so', async () => {
   const root = await tempDir('dpm-watch-cap-')
   const sessionsRoot = join(root, 'sessions')
+  const base = 1_800_000_000
   try {
-    // Five sessions with increasing activity times, so the ranking is knowable.
+    // Five sessions with explicit, increasing file mtimes, so "most recently
+    // active" is a property of the fixture instead of write timing (all five
+    // files land within the same millisecond otherwise).
     for (let index = 1; index <= 5; index += 1) {
-      await writeSessionLog(sessionsRoot, {
+      const path = await writeSessionLog(sessionsRoot, {
         id: `s${index}`,
         cwd: `C:\\work\\p${index}`,
         events: [event('turn/start', 0, index * 1_000, { turn: 1 })],
       })
+      await utimes(path, base + index, base + index)
     }
 
     const source = new DshSessionSource({

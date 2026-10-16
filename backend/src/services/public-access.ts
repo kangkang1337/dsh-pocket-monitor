@@ -21,7 +21,7 @@
  * @module dsh-pocket-monitor/services/public-access
  */
 
-import { createHash, randomInt, timingSafeEqual } from 'node:crypto'
+import { createHash, randomBytes, randomInt, scryptSync, timingSafeEqual } from 'node:crypto'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import type { PublicAccessStatus } from '../../../shared/types/index.ts'
@@ -90,17 +90,43 @@ export interface PublicGateOptions {
 
 /** Persisted PIN record. */
 interface PinFile {
-  readonly version: 1
-  readonly algorithm: 'sha256'
-  /** `sha256(pepper + pin)`; the PIN itself is never stored. */
+  readonly version: 1 | 2
+  /**
+   * `scrypt` for version 2 (per-install random salt, memory-hard), `sha256` for
+   * version 1 (a fixed pepper — kept only so an existing file keeps working).
+   */
+  readonly algorithm: 'sha256' | 'scrypt'
+  /** Encoded hash; the PIN itself is never stored. */
   readonly hash: string
+  /** Random salt for `scrypt`; absent in version 1 files. */
+  readonly salt?: string
   readonly createdAt: number
   /** True when the monitor generated it rather than the operator. */
   readonly generated: boolean
 }
 
-/** Hash a PIN with a fixed pepper. */
-function hashPin(pin: string): string {
+/**
+ * Cost parameters for `scrypt`.
+ *
+ * A PIN is only 4-12 digits, so the defence is a per-install random salt (an
+ * attacker cannot precompute a table for every installation) plus a memory-hard
+ * KDF, which makes an offline sweep of even the 10^6 six-digit space expensive
+ * rather than instant.
+ */
+const SCRYPT_PARAMS = { N: 16_384, r: 8, p: 1, keylen: 32 } as const
+
+/** Derive the stored form of a PIN. */
+function hashPin(pin: string, salt: string): string {
+  return scryptSync(pin, Buffer.from(salt, 'hex'), SCRYPT_PARAMS.keylen, {
+    N: SCRYPT_PARAMS.N,
+    r: SCRYPT_PARAMS.r,
+    p: SCRYPT_PARAMS.p,
+    maxmem: 128 * SCRYPT_PARAMS.N * SCRYPT_PARAMS.r * 2,
+  }).toString('hex')
+}
+
+/** Legacy fixed-pepper hash, used only to verify a version-1 file once. */
+function hashPinLegacy(pin: string): string {
   return createHash('sha256').update(`dsh-pocket-monitor/pin:${pin}`, 'utf8').digest('hex')
 }
 
@@ -152,6 +178,9 @@ export class PublicGate {
   private readonly dataDir: string
   private readonly localAuthorities: readonly string[]
   private pinHash: string | undefined
+  private pinSalt: string | undefined
+  private pinAlgorithm: 'sha256' | 'scrypt' = 'scrypt'
+  private legacyPinNote: string | undefined
   private pinGenerated = false
   private pinCreatedAt = 0
   private loaded = false
@@ -210,8 +239,16 @@ export class PublicGate {
       const parsed = JSON.parse(raw) as Partial<PinFile>
       if (typeof parsed.hash === 'string' && parsed.hash.length === 64) {
         this.pinHash = parsed.hash
+        this.pinSalt = typeof parsed.salt === 'string' ? parsed.salt : undefined
+        this.pinAlgorithm = parsed.algorithm === 'scrypt' && this.pinSalt !== undefined ? 'scrypt' : 'sha256'
         this.pinGenerated = parsed.generated === true
         this.pinCreatedAt = typeof parsed.createdAt === 'number' ? parsed.createdAt : 0
+        if (this.pinAlgorithm === 'sha256') {
+          // Upgrading a legacy record needs the PIN, which we do not have; it is
+          // re-hashed on the next successful verification instead. Say so once.
+          this.legacyPinNote =
+            '访问 PIN 使用的是旧版哈希（固定 pepper）。下次验证成功时会自动升级为加盐 scrypt；也可用 `npm run pin` 立即轮换。'
+        }
         return undefined
       }
     } catch {
@@ -226,18 +263,26 @@ export class PublicGate {
   /**
    * Set (or rotate) the PIN.
    *
+   * Stored as `scrypt` with a fresh per-installation random salt, so a leaked PIN
+   * file cannot be swept offline against a shared rainbow table.
+   *
    * @param pin - 4-12 digits.
    * @param generated - whether the monitor produced it.
    */
   async setPin(pin: string, generated: boolean): Promise<void> {
     if (!/^\d{4,12}$/.test(pin)) throw new Error('访问 PIN 必须是 4-12 位数字')
-    this.pinHash = hashPin(pin)
+    const salt = randomBytes(16).toString('hex')
+    this.pinHash = hashPin(pin, salt)
+    this.pinSalt = salt
+    this.pinAlgorithm = 'scrypt'
     this.pinGenerated = generated
     this.pinCreatedAt = Date.now()
+    this.legacyPinNote = undefined
     const payload: PinFile = {
-      version: 1,
-      algorithm: 'sha256',
+      version: 2,
+      algorithm: 'scrypt',
       hash: this.pinHash,
+      salt,
       createdAt: this.pinCreatedAt,
       generated,
     }
@@ -247,10 +292,30 @@ export class PublicGate {
     await rename(temp, this.pinFilePath)
   }
 
-  /** Verify a candidate PIN in constant time. */
+  /**
+   * Verify a candidate PIN in constant time.
+   *
+   * A legacy (version 1) record is accepted once and immediately re-hashed with a
+   * random salt, so an existing installation upgrades without the operator having
+   * to re-enter anything.
+   *
+   * @param candidate - the PIN the caller supplied.
+   * @returns true when it matches.
+   */
   verifyPin(candidate: string): boolean {
     if (this.pinHash === undefined) return false
-    return safeEqualHex(this.pinHash, hashPin(candidate))
+    if (this.pinAlgorithm === 'scrypt' && this.pinSalt !== undefined) {
+      return safeEqualHex(this.pinHash, hashPin(candidate, this.pinSalt))
+    }
+    if (!safeEqualHex(this.pinHash, hashPinLegacy(candidate))) return false
+    // Correct PIN on a legacy record: upgrade in the background.
+    void this.setPin(candidate, this.pinGenerated).catch(() => undefined)
+    return true
+  }
+
+  /** Note about a legacy PIN record that will be upgraded, if any. */
+  get pinUpgradeNote(): string | undefined {
+    return this.legacyPinNote
   }
 
   /**

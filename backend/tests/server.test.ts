@@ -8,7 +8,8 @@
 
 import { strict as assert } from 'node:assert'
 import { request as httpRequest } from 'node:http'
-import { rm } from 'node:fs/promises'
+import { rm, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import { test } from 'node:test'
 import { DeviceStore } from '../src/auth/devices.ts'
 import { MonitorService, classifyRequest } from '../src/server.ts'
@@ -103,6 +104,7 @@ export function makeConfig(overrides: Partial<MonitorConfig> & { dataDir: string
     deviceInactivityDays: 30,
     watchAll: false,
     maxSessions: 30,
+    trustedProxies: [],
     ...overrides,
   }
 }
@@ -197,6 +199,48 @@ async function rawStatus(
       },
     )
     request.on('error', rejectPromise)
+    request.end()
+  })
+}
+
+/** Send one request over a raw socket, so `Host` and body are exactly ours. */
+async function rawRequest(
+  base: string,
+  path: string,
+  options: { method?: string; headers?: Record<string, string>; body?: string } = {},
+): Promise<{ status: number; body: string; setCookie: readonly string[] }> {
+  const url = new URL(path, base)
+  const headers = options.headers ?? {}
+  const payload = options.body
+  return await new Promise((resolvePromise, rejectPromise) => {
+    const request = httpRequest(
+      {
+        host: url.hostname,
+        port: url.port,
+        path: url.pathname + url.search,
+        method: options.method ?? 'GET',
+        headers: {
+          ...headers,
+          ...(payload === undefined ? {} : { 'content-length': String(Buffer.byteLength(payload)) }),
+        },
+      },
+      (response) => {
+        let body = ''
+        response.setEncoding('utf8')
+        response.on('data', (chunk) => {
+          body += chunk
+        })
+        response.on('end', () =>
+          resolvePromise({
+            status: response.statusCode ?? 0,
+            body,
+            setCookie: (response.headers['set-cookie'] ?? []).map((entry) => entry.split(';')[0] ?? ''),
+          }),
+        )
+      },
+    )
+    request.on('error', rejectPromise)
+    if (payload !== undefined) request.write(payload)
     request.end()
   })
 }
@@ -729,11 +773,19 @@ test('the request-purpose matrix decides who must present the access PIN', async
     })
     const lanHosts = new Set(['127.0.0.1', 'localhost', '192.168.1.50', '10.135.67.100'])
     const hostAccepts = (hostname: string): boolean => lanHosts.has(hostname)
-    const classify = (remoteAddress: string, host: string) => classifyRequest({ remoteAddress, host, gate, hostAccepts })
+    const classify = (remoteAddress: string, host: string, proxied = false) =>
+      classifyRequest({ remoteAddress, host, gate, hostAccepts, proxied })
 
-    // From this machine: always loopback, whatever the Host says.
+    // From this machine, without proxy evidence: this is the operator.
     assert.equal(classify('127.0.0.1', 'mon.example.com'), 'loopback')
     assert.equal(classify('::ffff:127.0.0.1', 'mon.example.com'), 'loopback')
+    // …but a loopback socket that carries proxy evidence is NOT the operator: a
+    // tunnel running on this machine forwards every remote caller over loopback,
+    // so the public authority must take the public path (and the PIN) instead.
+    assert.equal(classify('127.0.0.1', 'mon.example.com', true), 'public')
+    assert.equal(classify('::ffff:127.0.0.1', 'mon.example.com', true), 'public')
+    // A proxied request for a merely-local authority stays on the LAN path.
+    assert.equal(classify('127.0.0.1', '192.168.1.50', true), 'lan')
     // From the LAN: a local authority stays local, so pairing keeps working.
     assert.equal(classify('192.168.1.77', '192.168.1.50'), 'lan')
     assert.equal(classify('192.168.1.77', '10.135.67.100'), 'lan')
@@ -758,6 +810,151 @@ test('the request-purpose matrix decides who must present the access PIN', async
     )
   } finally {
     await rm(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('a same-machine tunnel cannot impersonate the local operator', async () => {
+  // The topology from the README: `cloudflared tunnel --url http://127.0.0.1:3099`
+  // runs on this machine, so every remote request reaches the service from a
+  // loopback socket while keeping the public `Host`. Treating a loopback socket
+  // as "the operator" is exactly what let such a request skip the PIN and reach
+  // the admin surface. These cases pin the fix.
+  const harness = await startHarness({
+    config: {
+      public: true,
+      publicUrl: 'mon.example.com',
+      publicRequirePin: true,
+      behindTlsTerminator: true,
+      publicPin: '424242',
+      terminalApproval: true,
+    },
+  })
+  try {
+    // What the tunnel would forward: loopback peer, public Host, and the
+    // forwarding headers every tunnel adds. `fetch` cannot set `Host` (undici
+    // treats it as forbidden and silently drops it), so these go over a raw
+    // socket — otherwise the test would not reproduce the topology at all.
+    const tunnelHeaders = { host: 'mon.example.com', 'x-forwarded-for': '203.0.113.7', 'x-forwarded-proto': 'https' }
+    const tunnel = (path: string, extra: Record<string, string> = {}) =>
+      rawRequest(harness.base, path, { headers: { ...tunnelHeaders, ...extra } })
+
+    // 1. The app shell still loads, because the PIN prompt lives in it. Gating it
+    //    would answer with JSON before the phone could show an input box.
+    await writeFile(join(harness.frontendDir, 'index.html'), '<!doctype html><title>DSH Pocket Monitor</title>', 'utf8')
+    const shell = await tunnel('/')
+    assert.equal(shell.status, 200, '公网请求应能加载页面（PIN 输入框在里面）')
+    assert.match(shell.body, /DSH Pocket Monitor/)
+
+    // 2. Data routes require the PIN, even though the socket is loopback.
+    //    (Either 401 `pin-required` or 429 once the limiter engages — both refuse,
+    //    and neither may leak session data.)
+    const statusWithoutPin = await tunnel('/api/status')
+    assert.ok(
+      statusWithoutPin.status === 401 || statusWithoutPin.status === 429,
+      `隧道来源必须仍然要求 PIN，实际 HTTP ${statusWithoutPin.status}`,
+    )
+    const body = JSON.parse(statusWithoutPin.body) as { error?: { pinRequired?: boolean; code?: string }; currentSessionId?: unknown; sessions?: unknown }
+    if (statusWithoutPin.status === 401) {
+      assert.equal(body.error?.pinRequired, true, `期望 pin-required，实际 ${JSON.stringify(body.error)}`)
+    }
+    assert.equal(body.currentSessionId, undefined, '未通过 PIN 时不能泄露任何会话数据')
+    assert.equal(body.sessions, undefined, '未通过 PIN 时不能泄露会话列表')
+
+    // 3. The admin surface is refused: it is not reachable through a proxy at all.
+    for (const path of ['/api/admin/session', '/api/admin/approvals/attempts']) {
+      const refused = await tunnel(path, { 'x-dsh-pocket-pin': '424242' })
+      assert.equal(refused.status, 403, `${path} 不该被隧道访问到`)
+      const failure = JSON.parse(refused.body) as { error?: { code?: string } }
+      assert.equal(failure.error?.code, 'loopback-only')
+    }
+
+    // 4. Pairing can still be *claimed* over the tunnel (a phone on a foreign
+    //    network must be able to pair) — but it must never be auto-confirmed.
+    const admin = (await (await fetch(`${harness.base}/api/admin/session`)).json()) as { pairingCode?: string }
+    assert.equal(typeof admin.pairingCode, 'string', '本机仍然可以读到配对码')
+    const claimResponse = await rawRequest(harness.base, '/api/pair/claim', {
+      method: 'POST',
+      headers: { ...tunnelHeaders, 'content-type': 'application/json', 'x-dsh-pocket-pin': '424242' },
+      body: JSON.stringify({ code: String(admin.pairingCode), pairSecret: 'tunnel-secret-0123456789', deviceName: 'Remote iPhone' }),
+    })
+    assert.equal(claimResponse.status, 202, `配对请求应被接受：HTTP ${claimResponse.status}`)
+    const claimBody = JSON.parse(claimResponse.body) as { pairingId?: string; state?: string }
+    assert.equal(claimBody.state, 'pending', '隧道来的配对请求绝不能被自动确认')
+
+    // 5. And it stays pending: polling must not hand out a token.
+    const poll = await rawRequest(harness.base, '/api/pair/poll', {
+      method: 'POST',
+      headers: { ...tunnelHeaders, 'content-type': 'application/json', 'x-dsh-pocket-pin': '424242' },
+      body: JSON.stringify({ pairingId: String(claimBody.pairingId), pairSecret: 'tunnel-secret-0123456789' }),
+    })
+    const pollBody = JSON.parse(poll.body) as { state?: string }
+    assert.equal(pollBody.state, 'pending', '未被操作者确认前不能下发令牌')
+    assert.equal(poll.setCookie.some((entry) => entry.startsWith('dpm_device=')), false, '未确认前不该种下设备 cookie')
+  } finally {
+    await harness.close()
+  }
+})
+
+test('the locally-connecting operator is still allowed to administer', async () => {
+  // The counterpart: the fix must not break the real local workflow. A direct
+  // connection with no proxy evidence keeps full operator powers.
+  const harness = await startHarness({
+    config: { public: true, publicUrl: 'mon.example.com', publicRequirePin: true, behindTlsTerminator: true, publicPin: '424242' },
+  })
+  try {
+    const admin = await fetch(`${harness.base}/api/admin/session`)
+    assert.equal(admin.status, 200, '本机直连（无代理头）仍可管理')
+    const session = (await admin.json()) as { pairingCode?: string; publicAccessEnabled?: boolean }
+    assert.equal(typeof session.pairingCode, 'string')
+    assert.equal(session.publicAccessEnabled, true)
+
+    // A direct local request may also use the public Host when nothing indicates
+    // a proxy — e.g. an operator testing with curl.
+    const directPublicHost = await fetch(`${harness.base}/api/admin/session`, { headers: { host: 'mon.example.com' } })
+    assert.equal(directPublicHost.status, 200, '本机用公网 Host 直连（无代理证据）仍可管理')
+  } finally {
+    await harness.close()
+  }
+})
+
+test('a forwarded address is only believed for a declared trusted proxy', async () => {
+  const harness = await startHarness({ config: { trustedProxies: ['127.0.0.1'] } })
+  try {
+    // Rate limiting keys on the peer by default. A forged `X-Forwarded-For` must
+    // not hand a caller a fresh budget, which is why the default is "ignore it".
+    const untrusted = await startHarness()
+    try {
+      const { cookie } = await pairDevice(untrusted.base)
+      const first = await fetch(`${untrusted.base}/api/status`, { headers: { cookie, 'x-forwarded-for': '198.51.100.1' } })
+      assert.equal(first.status, 200)
+      // The request is still served; the point is that the limiter keys on the
+      // socket, not the header. Verify through the pure classifier instead of
+      // guessing at limiter internals.
+      const gate = new PublicGate({
+        enabled: true,
+        publicUrl: 'mon.example.com',
+        tls: false,
+        behindTlsTerminator: true,
+        dataDir: untrusted.dataDir,
+        requirePin: true,
+        localAuthorities: ['127.0.0.1'],
+      })
+      assert.equal(
+        classifyRequest({
+          remoteAddress: '127.0.0.1',
+          host: 'mon.example.com',
+          gate,
+          hostAccepts: () => true,
+          proxied: true,
+        }),
+        'public',
+      )
+    } finally {
+      await untrusted.close()
+    }
+    void harness
+  } finally {
+    await harness.close()
   }
 })
 

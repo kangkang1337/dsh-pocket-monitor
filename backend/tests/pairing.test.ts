@@ -6,7 +6,7 @@
  */
 
 import { strict as assert } from 'node:assert'
-import { mkdir, open, readFile, rm } from 'node:fs/promises'
+import { mkdir, open, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { DeviceStore, generateToken, hashToken, sanitiseDeviceName } from '../src/auth/devices.ts'
@@ -340,6 +340,88 @@ test('sweep drops dead records only after their retention window', async () => {
     await reloaded.load()
     assert.equal(reloaded.list().length, 1)
     assert.equal(reloaded.list()[0]?.name, '在用的手机')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('a corrupt registry is reported and never overwritten', async () => {
+  const dir = await tempDir('dpm-corrupt-')
+  try {
+    const path = join(dir, 'devices.json')
+
+    // Missing file is a fresh install, not a problem.
+    const fresh = new DeviceStore(dir, { inactivityDays: 30 })
+    await fresh.load()
+    assert.equal(fresh.loadState, 'missing')
+    assert.equal(fresh.loadError, undefined)
+
+    // A half-written file must not read as "no devices": that would silently
+    // unbind every paired phone on the next write.
+    await writeFile(path, '{"version":1,"devices":[{"id":"x"', 'utf8')
+    const broken = new DeviceStore(dir, { inactivityDays: 30 })
+    await broken.load()
+    assert.equal(broken.loadState, 'corrupt')
+    assert.ok(broken.loadError !== undefined)
+    assert.equal(broken.list().length, 0)
+
+    // Writing is refused, so the damaged file (and its recovery value) survives.
+    await assert.rejects(
+      () => broken.create({ name: '写不进去', token: generateToken() }),
+      /拒绝写入|无法写入设备注册表/,
+    )
+    const stillBroken = await readFile(path, 'utf8')
+    assert.match(stillBroken, /"id":"x"/, '损坏的文件必须原样保留，供人工恢复')
+
+    // A well-formed file without a devices array is also corruption, not "empty".
+    await writeFile(path, '{"version":1}', 'utf8')
+    const noArray = new DeviceStore(dir, { inactivityDays: 30 })
+    await noArray.load()
+    assert.equal(noArray.loadState, 'corrupt')
+    assert.match(String(noArray.loadError), /devices/)
+
+    // Unreadable (a directory where the file should be) is distinct from corrupt.
+    await rm(path, { force: true })
+    await mkdir(path)
+    const unreadable = new DeviceStore(dir, { inactivityDays: 30 })
+    await unreadable.load()
+    assert.equal(unreadable.loadState, 'unreadable')
+    assert.ok(unreadable.loadError !== undefined)
+
+    // And a valid file loads normally.
+    await rm(path, { recursive: true, force: true })
+    await writeFile(path, `${JSON.stringify({ version: 1, devices: [] }, null, 2)}\n`, 'utf8')
+    const good = new DeviceStore(dir, { inactivityDays: 30 })
+    await good.load()
+    assert.equal(good.loadState, 'ok')
+    assert.equal((await good.create({ name: 'iPhone', token: generateToken() })).name, 'iPhone')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('unusable entries in a valid registry are dropped but reported', async () => {
+  const dir = await tempDir('dpm-partial-')
+  try {
+    const path = join(dir, 'devices.json')
+    const token = generateToken()
+    const valid = {
+      id: 'device-1',
+      name: 'iPhone',
+      tokenHash: hashToken(token),
+      scopes: ['status:read'],
+      createdAt: T0,
+      lastSeenAt: T0,
+    }
+    // One good record, one that cannot be parsed as a device.
+    await writeFile(path, `${JSON.stringify({ version: 1, devices: [valid, { id: 'broken' }] }, null, 2)}\n`, 'utf8')
+    const store = new DeviceStore(dir, { inactivityDays: 30 })
+    await store.load()
+    assert.equal(store.loadState, 'ok', '部分可用不算损坏')
+    assert.equal(store.list().length, 1)
+    assert.match(String(store.loadError), /1 条无法解析/)
+    // The good device still authenticates.
+    assert.equal((await store.authenticate(token, T0))?.id, 'device-1')
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

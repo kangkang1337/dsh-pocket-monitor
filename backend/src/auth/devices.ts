@@ -140,6 +140,10 @@ export class DeviceStore {
   private writeQueue: Promise<void> = Promise.resolve()
   /** Last write failure, surfaced to the dashboard instead of thrown at a phone. */
   private persistError: string | undefined
+  /** How the file looked when it was loaded. */
+  private loadedState: 'ok' | 'missing' | 'corrupt' | 'unreadable' = 'ok'
+  /** Why loading failed, when it did. */
+  private loadFailure: string | undefined
 
   constructor(dataDir: string, options: Partial<DeviceStoreOptions> = {}) {
     this.path = join(dataDir, 'devices.json')
@@ -161,17 +165,62 @@ export class DeviceStore {
     return this.persistError
   }
 
-  /** Load the registry, tolerating a missing file. */
+  /** How the registry file looked on load. */
+  get loadState(): 'ok' | 'missing' | 'corrupt' | 'unreadable' {
+    return this.loadedState
+  }
+
+  /** Why the registry could not be used, when it could not. */
+  get loadError(): string | undefined {
+    return this.loadFailure
+  }
+
+  /**
+   * Load the registry.
+   *
+   * A missing file is a fresh install and yields an empty list. Anything else —
+   * a parse failure, a permission error, a half-written file — is reported and
+   * the store switches to refusing writes, because a write would replace a
+   * registry we could not read with an empty one and silently unbind every
+   * paired phone.
+   */
   async load(): Promise<void> {
     if (this.loaded) return
-    try {
-      const raw = await readFile(this.path, 'utf8')
-      const parsed = JSON.parse(raw) as Partial<DeviceFile>
-      this.devices = Array.isArray(parsed.devices) ? parsed.devices.filter(isDeviceRecord) : []
-    } catch {
-      this.devices = []
-    }
     this.loaded = true
+    let raw: string
+    try {
+      raw = await readFile(this.path, 'utf8')
+    } catch (error) {
+      if (errorCode(error) === 'ENOENT') {
+        this.devices = []
+        this.loadedState = 'missing'
+        return
+      }
+      this.devices = []
+      this.loadedState = 'unreadable'
+      this.loadFailure = describeWriteError(error)
+      return
+    }
+    try {
+      const parsed = JSON.parse(raw) as Partial<DeviceFile>
+      if (!Array.isArray(parsed.devices)) {
+        this.devices = []
+        this.loadedState = 'corrupt'
+        this.loadFailure = '注册表缺少 devices 数组'
+        return
+      }
+      const usable = parsed.devices.filter(isDeviceRecord)
+      // Dropping unusable entries is worth saying out loud, too.
+      if (usable.length !== parsed.devices.length) {
+        this.loadFailure = `注册表里有 ${parsed.devices.length - usable.length} 条无法解析的设备记录（已忽略，未改动文件）`
+      }
+      this.devices = usable
+      this.loadedState = 'ok'
+    } catch (error) {
+      this.devices = []
+      this.loadedState = 'corrupt'
+      this.loadFailure = describeWriteError(error)
+    }
   }
 
   /**
@@ -187,6 +236,14 @@ export class DeviceStore {
    */
   private persist(): Promise<boolean> {
     const run = async (): Promise<boolean> => {
+      // Never overwrite a registry we could not read: doing so would replace it
+      // with an empty list and silently unbind every paired phone.
+      if (this.loadedState === 'corrupt' || this.loadedState === 'unreadable') {
+        this.persistError =
+          `拒绝写入：设备注册表${this.loadedState === 'corrupt' ? '内容损坏' : '无法读取'}（${this.loadFailure ?? '未知原因'}）。` +
+          '请先备份并移走该文件，或修复权限后重启服务。'
+        return false
+      }
       const payload: DeviceFile = { version: 1, devices: this.devices }
       const body = `${JSON.stringify(payload, null, 2)}\n`
       await mkdir(dirname(this.path), { recursive: true })

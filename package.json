@@ -1,6 +1,6 @@
 {
   "name": "dsh-pocket-monitor",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "description": "手机端只读监控 Windows 上 DSH 任务状态的工具（不修改 DSH，不依赖 DSH 插件；支持局域网与可选公网模式）",
   "type": "module",
