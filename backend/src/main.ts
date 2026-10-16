@@ -70,7 +70,7 @@ async function main(): Promise<void> {
     return
   }
 
-  const devices = new DeviceStore(config.dataDir)
+  const devices = new DeviceStore(config.dataDir, { inactivityDays: config.deviceInactivityDays })
   await devices.load()
   const source = new DshSessionSource({
     dshHome: config.dshHome,
@@ -113,6 +113,7 @@ async function main(): Promise<void> {
       `  本机地址：http://127.0.0.1:${runtime.port}/`,
       `  公网访问：${publicAccess.mode}${publicAccess.url === null ? '' : `  ${publicAccess.url}`}`,
       `            ${publicAccess.reason}`,
+      `  设备过期：${config.deviceInactivityDays === 0 ? '不自动过期（只受手动撤销控制）' : `${config.deviceInactivityDays} 天未使用即失效`}`,
       `  关闭方法：在终端按 Ctrl+C（或在本终端输入 q 回车）`,
       '',
     ].join('\n'),

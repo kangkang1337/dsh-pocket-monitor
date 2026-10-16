@@ -110,6 +110,8 @@ export class MonitorService {
   private readonly frontendDir: string
   private server: Server | HttpsServer | undefined
   private pollTimer: NodeJS.Timeout | undefined
+  private sweepTimer: NodeJS.Timeout | undefined
+  private sweepTimerNote = ''
   private snapshot: { payload: StatusPayload; at: number } | undefined
   private busy = false
   private stopped = false
@@ -170,6 +172,67 @@ export class MonitorService {
     return [...this.attempts].reverse()
   }
 
+  /**
+   * Run the device retention sweep once.
+   *
+   * Called at startup and on an interval; also reachable through the loopback
+   * admin API so the operator can clean up on demand.
+   *
+   * @param now - current time (injected for tests).
+   * @returns how many records were expired and how many were removed.
+   */
+  async sweepDevices(now = Date.now()): Promise<{ expired: number; removed: number }> {
+    const result = await this.devices.sweep(now)
+    if (result.expired > 0 || result.removed > 0) {
+      this.sweepTimerNote = `上次清理：标记过期 ${result.expired} 台、移除 ${result.removed} 条（${new Date(now).toLocaleString()}）`
+    }
+    return result
+  }
+
+  /**
+   * Device listing with live status and expiry, for the terminal dashboard and
+   * the loopback admin API.
+   *
+   * @param now - current time (injected for tests).
+   * @returns the listing plus per-status counts.
+   */
+  private async deviceListing(now = Date.now()): Promise<{
+    devices: readonly Record<string, unknown>[]
+    counts: { active: number; expired: number; revoked: number }
+  }> {
+    await this.devices.load()
+    const devices = this.devices.list().map((device) => {
+      const status = this.devices.classify(device, now)
+      return {
+        ...publicDevice(device),
+        status,
+        expiresAt: this.devices.expiryOf(device, now) ?? null,
+      }
+    })
+    return {
+      devices,
+      counts: {
+        active: devices.filter((entry) => entry['status'] === 'active').length,
+        expired: devices.filter((entry) => entry['status'] === 'expired').length,
+        revoked: devices.filter((entry) => entry['status'] === 'revoked').length,
+      },
+    }
+  }
+
+  /** Human note about the last retention sweep. */
+  get lastSweepNote(): string {
+    return this.sweepTimerNote
+  }
+
+  /** Start the periodic retention sweep. */
+  private startSweepTimer(): void {
+    const interval = 6 * 60 * 60 * 1000
+    this.sweepTimer = setInterval(() => {
+      void this.sweepDevices()
+    }, interval)
+    this.sweepTimer.unref()
+  }
+
   /** The latest status payload, refreshing it when it is older than the poll interval. */
   async currentStatus(force = false): Promise<StatusPayload> {
     const now = Date.now()
@@ -195,6 +258,8 @@ export class MonitorService {
   /** Bind the socket and start the poll loop. */
   async start(): Promise<RuntimeInfo> {
     await this.devices.load()
+    // Retention first: a stale record must not look usable even for one request.
+    await this.sweepDevices()
     await this.refresh(true)
     // Mint the first pairing code immediately, so a code exists whether or not an
     // interactive dashboard is attached and the operator never sees an empty QR.
@@ -218,6 +283,7 @@ export class MonitorService {
       void this.tick()
     }, interval)
     this.pollTimer.unref()
+    this.startSweepTimer()
     return this.runtimeInfo()
   }
 
@@ -273,6 +339,10 @@ export class MonitorService {
     this.stopped = true
     if (this.pollTimer !== undefined) clearInterval(this.pollTimer)
     this.pollTimer = undefined
+    if (this.sweepTimer !== undefined) clearInterval(this.sweepTimer)
+    this.sweepTimer = undefined
+    // Opportunistically persist the batched lastSeenAt values before exiting.
+    await this.devices.flushTouches().catch(() => undefined)
     this.pairing.revokeAll()
     this.sse.close()
     for (const handler of this.shutdownHandlers) handler()
@@ -526,7 +596,12 @@ export class MonitorService {
         pairingNonce: view?.nonce ?? null,
         pairingExpiresAt: view?.expiresAt ?? null,
         claim: view?.claim ?? null,
-        devices: this.devices.list().map(publicDevice),
+        devices: (await this.deviceListing()).devices,
+        deviceRetention: {
+          inactivityDays: this.devices.retention.inactivityDays,
+          revokedRetentionDays: this.devices.retention.revokedRetentionDays,
+          note: this.sweepTimerNote,
+        },
         sseClients: this.sse.size,
         source: (await this.currentStatus()).source,
         publicAccess: this.gate.status(),
@@ -589,6 +664,11 @@ export class MonitorService {
     }
     if (path === '/api/admin/approvals/attempts' && method === 'GET') {
       this.sendJson(res, 200, { attempts: this.approvalAttempts })
+      return
+    }
+    if (path === '/api/admin/devices/sweep' && method === 'POST') {
+      const result = await this.sweepDevices()
+      this.sendJson(res, 200, { ...result, devices: (await this.deviceListing()).devices })
       return
     }
     const revokeMatch = /^\/api\/admin\/devices\/([^/]+)$/.exec(path)

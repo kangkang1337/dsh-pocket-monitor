@@ -34,6 +34,11 @@ export interface MonitorConfig {
   readonly terminalApproval: boolean
   /** Print the access URL and QR block on startup. */
   readonly printQr: boolean
+  /**
+   * Days a paired device may sit unused before its token stops working and the
+   * record becomes removable. `0` disables expiry (revoke-only).
+   */
+  readonly deviceInactivityDays: number
   /** Enable public-access mode: accept requests on a non-LAN authority. */
   readonly public: boolean
   /** The public authority this service is reachable at (host or host:port). */
@@ -69,6 +74,7 @@ export interface CliOptions {
   readonly behindTlsTerminator?: boolean
   readonly tlsCertPath?: string
   readonly tlsKeyPath?: string
+  readonly deviceInactivityDays?: number
 }
 
 /** Flags that take a value, so the parser can reject a missing one. */
@@ -85,6 +91,7 @@ const VALUE_FLAGS = new Set([
   '--public-pin',
   '--tls-cert',
   '--tls-key',
+  '--device-ttl',
 ])
 
 /** Boolean flags. */
@@ -118,6 +125,7 @@ export function parseCliOptions(argv: readonly string[]): CliOptions {
   let behindTlsTerminator: boolean | undefined
   let tlsCertPath: string | undefined
   let tlsKeyPath: string | undefined
+  let deviceInactivityDays: number | undefined
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]
@@ -181,6 +189,12 @@ export function parseCliOptions(argv: readonly string[]): CliOptions {
       case '--tls-key':
         tlsKeyPath = resolve(value)
         break
+      case '--device-ttl': {
+        const parsed = Number(value)
+        if (!Number.isInteger(parsed) || parsed < 0) throw new Error(`--device-ttl 必须是 >= 0 的整数天，收到 ${value}`)
+        deviceInactivityDays = parsed
+        break
+      }
       default:
         break
     }
@@ -204,6 +218,7 @@ export function parseCliOptions(argv: readonly string[]): CliOptions {
     ...(behindTlsTerminator === undefined ? {} : { behindTlsTerminator }),
     ...(tlsCertPath === undefined ? {} : { tlsCertPath }),
     ...(tlsKeyPath === undefined ? {} : { tlsKeyPath }),
+    ...(deviceInactivityDays === undefined ? {} : { deviceInactivityDays }),
   }
 }
 
@@ -244,6 +259,8 @@ export function resolveConfig(
     ...(publicPin === undefined ? {} : { publicPin }),
     publicRequirePin: options.publicRequirePin ?? env.DSH_POCKET_MONITOR_PUBLIC_PIN_REQUIRED !== '0',
     behindTlsTerminator: options.behindTlsTerminator ?? env.DSH_POCKET_MONITOR_BEHIND_TLS === '1',
+    deviceInactivityDays:
+      options.deviceInactivityDays ?? numberFromEnv(env.DSH_POCKET_MONITOR_DEVICE_TTL_DAYS, 30),
     ...(tlsCertPath === undefined ? {} : { tlsCertPath }),
     ...(tlsKeyPath === undefined ? {} : { tlsKeyPath }),
   }

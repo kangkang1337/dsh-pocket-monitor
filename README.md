@@ -117,11 +117,37 @@ npm run dev              # 终端 2：Vite 5173，自动把 /api 代理到后端
 - 电脑端：服务终端按 `d` 查看已绑定设备列表；也可以用管理接口撤销：
 
 ```powershell
-# 列出设备（含 id）
+# 列出设备（含 id、状态、过期时间）
 curl http://127.0.0.1:3099/api/admin/session
 # 撤销某台设备（id 取上一行的值）
 curl -X DELETE http://127.0.0.1:3099/api/admin/devices/<设备id>
 ```
+
+### 设备记录会自动过期清理
+
+反复配对（比如排查网络时扫了好几次码）会留下多条 `iPhone` 记录。现在的规则：
+
+| 情况 | 结果 |
+| --- | --- |
+| 超过 **30 天**没有任何请求 | 令牌失效，手机需重新扫码配对；记录仍留在列表里，标为「已过期」，方便你查看发生了什么 |
+| 失效或已被撤销的记录再过 **30 天** | 自动从 `data/devices.json` 移除 |
+| 命令 `POST /api/admin/devices/sweep` | 立刻手动清理一次（只允许本机访问） |
+
+清理时机：服务启动时、每 6 小时、以及上面那个手动接口。想调整或关掉：
+
+```powershell
+npm run start:lan -- --device-ttl 90      # 90 天不用才作废
+npm run start:lan -- --device-ttl 0       # 永不过期，只能手动撤销
+```
+
+查看当前状态（每台设备带 `status`：`active` / `expired` / `revoked`，以及 `expiresAt`）：
+
+```powershell
+curl.exe -s http://127.0.0.1:3099/api/admin/session
+```
+
+> 被 system 清理掉的那条记录，在手机上表现为「会话已失效，请重新配对」——重扫一次码即可，不影响其他设备。
+
 
 ## 界面说明
 
@@ -157,6 +183,7 @@ curl -X DELETE http://127.0.0.1:3099/api/admin/devices/<设备id>
 | `--trusted-origin` | — | 无 | 额外允许的 Host 权威，可重复 |
 | `--no-terminal-approval` | `DSH_POCKET_MONITOR_TERMINAL_APPROVAL=0` | 开启 | 关闭「本机扫码自动确认」，改为必须手动确认 |
 | `--no-qr` | `DSH_POCKET_MONITOR_PRINT_QR=0` | 打印 | 不打印二维码 |
+| `--device-ttl` | `DSH_POCKET_MONITOR_DEVICE_TTL_DAYS` | `30` | 已配对设备多少天没用就作废（需重新配对）；`0` = 永不过期，只能手动撤销 |
 | `--public` | `DSH_POCKET_MONITOR_PUBLIC=1` | 关闭 | 启用公网模式（见下节） |
 | `--public-url` | `DSH_POCKET_MONITOR_PUBLIC_URL` | 无 | 你在公网用的域名；不写则接受任何非本地 Host |
 | `--behind-tls` | `DSH_POCKET_MONITOR_BEHIND_TLS=1` | 关闭 | 确认隧道/反向代理已终止 TLS（公网模式必需其一） |
@@ -358,6 +385,7 @@ npm run pin -- --public-pin 000000         # 换掉 PIN（若你开了公网模�
 | **公网模式缺 TLS 时拒绝启动** | ✅ 已验证 | 实测 `--public` 无 TLS → 退出码 1 并说明原因（`validatePublicMode` 单测覆盖三种组合） |
 | **访问 PIN 与令牌的暴力破解限速** | ✅ 已验证 | 单测：PIN 每地址 10 次/10 分钟封顶、令牌失败每地址 30 次 + 全局 300 次、成功后清零预算 |
 | **Tailscale 换网络访问（推荐路径）** | ✅ 本机实测 | Tailscale 接口上 `http://100.x.x.x:3099/api/health` 返回 200；`--trusted-origin <电脑名>.<tailnet>.ts.net` 放行后域名访问正常、配对成功。**注意**：同一 Wi-Fi 若开了客户端隔离，局域网直连会「网络出错」（实测遇到），这是网络侧限制，走 Tailscale 可绕开 |
+| **设备记录过期与自动清理** | ✅ 已验证 | 单测覆盖：窗口内可用 / 过期边界（±1 秒）/ 过期后令牌失效 / `--device-ttl 0` 关闭过期 / 保留期内只标过期不删除 / 超过保留期被清理且幂等 / `lastSeenAt` 批量落盘 / 管理接口报告 `status`+`expiresAt` / 手动 sweep 接口 |
 
 ### 受 DSH 现有接口限制（**没有**实现，并且**不会**假装成功）
 

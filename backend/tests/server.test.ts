@@ -100,6 +100,7 @@ export function makeConfig(overrides: Partial<MonitorConfig> & { dataDir: string
     public: false,
     publicRequirePin: true,
     behindTlsTerminator: false,
+    deviceInactivityDays: 30,
     ...overrides,
   }
 }
@@ -117,7 +118,8 @@ async function startHarness(
     terminalApproval: options.terminalApproval ?? true,
     ...options.config,
   })
-  const devices = new DeviceStore(dataDir)
+  // Mirror main.ts: the store carries the configured retention policy.
+  const devices = new DeviceStore(dataDir, { inactivityDays: config.deviceInactivityDays })
   await devices.load()
   // Mirror main.ts: build the gate from the config, load its PIN, then inject it.
   let gate: PublicGate | undefined
@@ -888,6 +890,56 @@ test('the access PIN can be rotated from the loopback admin API', async () => {
       body: JSON.stringify({ pin: 'abc' }),
     })
     assert.equal(invalid.status, 400)
+  } finally {
+    await harness.close()
+  }
+})
+
+test('the admin listing reports device status, and the sweep endpoint works', async () => {
+  const harness = await startHarness()
+  try {
+    const { deviceId } = await pairDevice(harness.base, 'iPhone')
+
+    // A freshly paired device is active, with an expiry in the future.
+    const session = await adminSession(harness.base)
+    const devices = session.devices as Array<Record<string, unknown>>
+    assert.equal(devices.length, 1)
+    assert.equal(devices[0]?.['id'], deviceId)
+    assert.equal(devices[0]?.['status'], 'active')
+    assert.equal(typeof devices[0]?.['expiresAt'], 'number')
+    assert.ok((devices[0]?.['expiresAt'] as number) > Date.now(), '过期时间应在未来')
+    const retention = session.deviceRetention as { inactivityDays: number; revokedRetentionDays: number }
+    assert.equal(retention.inactivityDays, 30)
+    assert.equal(retention.revokedRetentionDays, 30)
+
+    // Revoking flips the reported status without removing the record.
+    await fetch(`${harness.base}/api/admin/devices/${deviceId}`, { method: 'DELETE' })
+    const afterRevoke = (await adminSession(harness.base)).devices as Array<Record<string, unknown>>
+    assert.equal(afterRevoke[0]?.['status'], 'revoked')
+    assert.equal(afterRevoke.length, 1, '撤销后仍留在审计列表里')
+
+    // Sweeping on demand is available over loopback and reports what it did.
+    const sweep = await fetch(`${harness.base}/api/admin/devices/sweep`, { method: 'POST' })
+    assert.equal(sweep.status, 200)
+    const sweepBody = (await sweep.json()) as { expired: number; removed: number; devices: readonly unknown[] }
+    assert.equal(sweepBody.removed, 0, '刚撤销的设备还在保留期内')
+    assert.equal(sweepBody.devices.length, 1)
+  } finally {
+    await harness.close()
+  }
+})
+
+test('a device that outlives its inactivity window stops authenticating', async () => {
+  const harness = await startHarness({ config: { deviceInactivityDays: 0 } })
+  try {
+    // With expiry disabled the listing reports no deadline at all.
+    const { deviceId } = await pairDevice(harness.base)
+    const session = await adminSession(harness.base)
+    const devices = session.devices as Array<Record<string, unknown>>
+    assert.equal(devices[0]?.['id'], deviceId)
+    assert.equal(devices[0]?.['status'], 'active')
+    assert.equal(devices[0]?.['expiresAt'], null, '关闭过期时不应给出过期时间')
+    assert.equal((session.deviceRetention as { inactivityDays: number }).inactivityDays, 0)
   } finally {
     await harness.close()
   }
